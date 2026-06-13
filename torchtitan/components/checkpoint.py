@@ -58,43 +58,22 @@ class ModelWrapper(Stateful):
     A wrapper for `nn.Module` (or a list of modules) that provides a unified `Stateful`
     interface for distributed checkpointing.
 
-    This class serves two purposes:
-        1. Flattening/Aggregation: It combines the state dicts of multiple
-           different modules (like individual chunks in Pipeline Parallelism)
-           into a single flat view so checkpointing code can interact
-           with them through a unified interface.
-        2. State Dict Caching: It caches the flattened state dict and returns
-           the same dictionary object on subsequent `state_dict()` calls.
-           This avoids repeatedly reconstructing the aggregated state dict and
-           allows downstream checkpointing implementations to reuse the cached
-           mapping when stable object references are beneficial.
-
-    Notes:
-        - Calling `load_state_dict` updates the underlying modules and
-        refreshes the cached state_dict.
-        - The model architecture should not be structurally modified (e.g.,
-        changing keys or replacing tensor references) after wrapping, or the
-        cache will become stale.
+    Combines the state dicts of multiple modules (e.g. Pipeline Parallelism chunks)
+    into a single flat view so checkpointing code can interact with them through a
+    unified interface.
     """
 
     def __init__(self, model: nn.Module | list[nn.Module]) -> None:
         self.model = [model] if isinstance(model, nn.Module) else model
-        self.cached_state_dict = self._get_state_dict()
-
-    def _get_state_dict(self) -> dict[str, Any]:
-        # TorchTitan already makes model state_dict keys canonical.
-        return {k: v for model in self.model for k, v in model.state_dict().items()}
 
     def state_dict(self) -> dict[str, Any]:
-        return self.cached_state_dict
+        return {k: v for model in self.model for k, v in model.state_dict().items()}
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         # strict=False because state_dict is the flattened checkpoint dict, which
         # mixes model FQN keys with non-model keys (optimizer, lr_scheduler, ...).
         for model in self.model:
             model.load_state_dict(state_dict, strict=False)
-        # Refresh the cache so state_dict() reflects the freshly loaded values.
-        self.cached_state_dict = self._get_state_dict()
 
 
 class Terminate:
@@ -633,8 +612,9 @@ class CheckpointManager(Configurable):
         else:
             dcp.load(state_dict, checkpoint_id=checkpoint_id)
 
-            # TODO: Since we flatten the model states in state_dict, we need to
-            # manually call load_state_dict() for the model. Need to fix this.
+            # Model params are flattened into the top-level dict, so DCP fills
+            # them directly. We then call load_state_dict() to trigger any
+            # load hooks (e.g. FusedQKVLinear merging wq/wk/wv back into wqkv).
             if MODEL in self.states:
                 self.states[MODEL].load_state_dict(state_dict)
 

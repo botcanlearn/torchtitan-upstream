@@ -117,6 +117,83 @@ class DummyTrainerConfig:
         )
 
 
+class TestModelWrapper(unittest.TestCase):
+    """Verify ModelWrapper.state_dict() returns current values even when
+    modules use state_dict hooks that produce disconnected tensor copies."""
+
+    def test_state_dict_reflects_updates_with_hooks(self):
+        from torchtitan.components.checkpoint import ModelWrapper
+
+        class HookedModule(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fused_weight = nn.Parameter(torch.zeros(4, 4))
+                self.register_state_dict_post_hook(self._split_on_save)
+                self.register_load_state_dict_pre_hook(self._merge_on_load)
+
+            @staticmethod
+            def _split_on_save(module, state_dict, prefix, local_metadata):
+                w = state_dict.pop(f"{prefix}fused_weight")
+                state_dict[f"{prefix}part_a"] = w[:2].contiguous()
+                state_dict[f"{prefix}part_b"] = w[2:].contiguous()
+
+            @staticmethod
+            def _merge_on_load(module, state_dict, prefix, *args):
+                a_key, b_key = f"{prefix}part_a", f"{prefix}part_b"
+                if a_key in state_dict and b_key in state_dict:
+                    state_dict[f"{prefix}fused_weight"] = torch.cat(
+                        [state_dict.pop(a_key), state_dict.pop(b_key)], dim=0
+                    )
+
+        model = HookedModule()
+        wrapper = ModelWrapper(model)
+
+        sd_before = wrapper.state_dict()
+        self.assertIn("part_a", sd_before)
+        self.assertIn("part_b", sd_before)
+        self.assertTrue(torch.all(sd_before["part_a"] == 0))
+
+        with torch.no_grad():
+            model.fused_weight.fill_(1.0)
+
+        sd_after = wrapper.state_dict()
+        self.assertTrue(torch.all(sd_after["part_a"] == 1.0))
+        self.assertTrue(torch.all(sd_after["part_b"] == 1.0))
+
+    def test_load_state_dict_triggers_hooks(self):
+        from torchtitan.components.checkpoint import ModelWrapper
+
+        class HookedModule(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fused_weight = nn.Parameter(torch.zeros(4, 4))
+                self.register_state_dict_post_hook(self._split_on_save)
+                self.register_load_state_dict_pre_hook(self._merge_on_load)
+
+            @staticmethod
+            def _split_on_save(module, state_dict, prefix, local_metadata):
+                w = state_dict.pop(f"{prefix}fused_weight")
+                state_dict[f"{prefix}part_a"] = w[:2].contiguous()
+                state_dict[f"{prefix}part_b"] = w[2:].contiguous()
+
+            @staticmethod
+            def _merge_on_load(module, state_dict, prefix, *args):
+                a_key, b_key = f"{prefix}part_a", f"{prefix}part_b"
+                if a_key in state_dict and b_key in state_dict:
+                    state_dict[f"{prefix}fused_weight"] = torch.cat(
+                        [state_dict.pop(a_key), state_dict.pop(b_key)], dim=0
+                    )
+
+        model = HookedModule()
+        wrapper = ModelWrapper(model)
+
+        loaded_sd = {"part_a": torch.ones(2, 4), "part_b": torch.full((2, 4), 2.0)}
+        wrapper.load_state_dict(loaded_sd)
+
+        self.assertTrue(torch.all(model.fused_weight[:2] == 1.0))
+        self.assertTrue(torch.all(model.fused_weight[2:] == 2.0))
+
+
 class TestCheckpointManager(unittest.TestCase):
     def setUp(self):
         self.base_temp_dir = tempfile.mkdtemp()

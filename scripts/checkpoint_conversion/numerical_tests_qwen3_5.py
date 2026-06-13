@@ -277,9 +277,11 @@ def run_tt(model_flavor, checkpoint_path, tt_inputs, special_tokens, device):
     model.init_states(buffer_device=torch.device("cpu"))
     model.half()
 
-    state_dict = ModelWrapper(model)._get_state_dict()
+    wrapper = ModelWrapper(model)
     print(f"  Loading checkpoint: {checkpoint_path}")
+    state_dict = wrapper.state_dict()
     dcp.load(state_dict, checkpoint_id=checkpoint_path)
+    wrapper.load_state_dict(state_dict)
     model.to(device)
 
     # Replace FlexAttention with SDPA for single-process inference
