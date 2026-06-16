@@ -1,0 +1,182 @@
+name: Sync Meta TorchTitan Upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-meta-torchtitan-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      SOURCE_REPOS: |
+        https://github.com/pytorch/torchtitan.git
+      CONTROL_BRANCH: github-sync
+      SOURCE_DEFAULT_BRANCH: main
+      TARGET_DEFAULT_BRANCH: main
+    steps:
+      - name: Checkout sync control branch
+        uses: actions/checkout@v6
+
+      - name: Mirror upstream branches and tags
+        env:
+          TARGET_REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ github.token }}
+          UPSTREAM_SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          push_token="${UPSTREAM_SYNC_TOKEN:-$GITHUB_TOKEN}"
+          if [ -z "${UPSTREAM_SYNC_TOKEN:-}" ]; then
+            echo "::warning::UPSTREAM_SYNC_TOKEN is not set; branches that update workflow files may be rejected"
+          fi
+          dst="https://x-access-token:${push_token}@github.com/${TARGET_REPO}.git"
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+
+          git_opts=(-c http.version=HTTP/1.1 -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=120)
+
+          clone_with_retry() {
+            local src="$1"
+            local attempt
+            for attempt in 1 2 3 4 5 6; do
+              rm -rf "$tmp/src.git"
+              if timeout 1200 git "${git_opts[@]}" clone --mirror "$src" "$tmp/src.git"; then
+                printf '%s\n' "$src" > "$tmp/selected-source"
+                return 0
+              fi
+              echo "::warning::clone failed for $src on attempt $attempt"
+              sleep $((attempt * attempt * 5))
+            done
+            return 1
+          }
+
+          selected=0
+          while IFS= read -r src; do
+            [ -z "$src" ] && continue
+            if clone_with_retry "$src"; then
+              selected=1
+              break
+            fi
+          done <<< "$SOURCE_REPOS"
+
+          if [ "$selected" != 1 ]; then
+            echo "::warning::all source repositories failed; leaving existing mirror unchanged"
+            exit 0
+          fi
+
+          echo "selected_source=$(cat "$tmp/selected-source")"
+          cd "$tmp/src.git"
+          git remote add github "$dst"
+
+          push_with_retry() {
+            local attempt
+            for attempt in 1 2 3 4 5; do
+              if git "${git_opts[@]}" push github "$@"; then
+                return 0
+              fi
+              echo "::warning::push failed on attempt $attempt"
+              sleep $((attempt * 10))
+            done
+            return 1
+          }
+
+          : > "$tmp/head-refspecs"
+          git for-each-ref --format='%(refname)' refs/heads | while IFS= read -r ref; do
+            branch="${ref#refs/heads/}"
+            [ "$branch" = "$CONTROL_BRANCH" ] && continue
+            [ "$branch" = "$TARGET_DEFAULT_BRANCH" ] && continue
+            printf '+%s:%s\n' "$ref" "$ref" >> "$tmp/head-refspecs"
+          done
+
+          if [ -s "$tmp/head-refspecs" ]; then
+            mapfile -t head_refspecs < "$tmp/head-refspecs"
+            for ((i = 0; i < ${#head_refspecs[@]}; i += 40)); do
+              push_with_retry "${head_refspecs[@]:i:40}"
+            done
+          fi
+
+          source_default_sha="$(git rev-parse "refs/heads/${SOURCE_DEFAULT_BRANCH}")"
+          target_default_sha="$(git ls-remote --heads github "$TARGET_DEFAULT_BRANCH" | awk '{print $1}')"
+          current_workflow_blob="$(git hash-object "$GITHUB_WORKSPACE/.github/workflows/sync-upstream.yml")"
+          need_default_push=1
+          if [ -n "$target_default_sha" ]; then
+            git fetch github "$TARGET_DEFAULT_BRANCH" --depth=2 || true
+            if git cat-file -e FETCH_HEAD^{commit} 2>/dev/null; then
+              target_parent="$(git rev-parse FETCH_HEAD^ 2>/dev/null || true)"
+              target_workflow_blob="$(git rev-parse FETCH_HEAD:.github/workflows/sync-upstream.yml 2>/dev/null || true)"
+              if [ "$target_parent" = "$source_default_sha" ] && [ "$target_workflow_blob" = "$current_workflow_blob" ]; then
+                need_default_push=0
+              fi
+            fi
+          fi
+
+          if [ "$need_default_push" = 1 ]; then
+            git clone "$tmp/src.git" "$tmp/default-work"
+            cd "$tmp/default-work"
+            git checkout -B "$TARGET_DEFAULT_BRANCH" "$source_default_sha"
+            mkdir -p .github/workflows
+            cp "$GITHUB_WORKSPACE/.github/workflows/sync-upstream.yml" .github/workflows/sync-upstream.yml
+            git config user.name "botcanlearn-sync"
+            git config user.email "botcanlearn-sync@users.noreply.github.com"
+            git add .github/workflows/sync-upstream.yml
+            git commit -m "chore: keep hourly upstream sync workflow" || true
+            git remote add github "$dst"
+            push_with_retry HEAD:refs/heads/"$TARGET_DEFAULT_BRANCH"
+            cd "$tmp/src.git"
+          fi
+
+          : > "$tmp/tag-refspecs"
+          git for-each-ref --format='+%(refname):%(refname)' refs/tags > "$tmp/tag-refspecs"
+          if [ -s "$tmp/tag-refspecs" ]; then
+            mapfile -t tag_refspecs < "$tmp/tag-refspecs"
+            for ((i = 0; i < ${#tag_refspecs[@]}; i += 40)); do
+              push_with_retry "${tag_refspecs[@]:i:40}"
+            done
+          fi
+
+          git for-each-ref --format='%(refname:strip=2)' refs/heads > "$tmp/source-heads"
+          git ls-remote --heads github | awk '{print $2}' | sed 's#refs/heads/##' > "$tmp/target-heads"
+          while IFS= read -r branch; do
+            [ -z "$branch" ] && continue
+            [ "$branch" = "$CONTROL_BRANCH" ] && continue
+            [ "$branch" = "$TARGET_DEFAULT_BRANCH" ] && continue
+            if ! grep -Fxq -- "$branch" "$tmp/source-heads"; then
+              push_with_retry ":refs/heads/$branch"
+            fi
+          done < "$tmp/target-heads"
+
+          git for-each-ref --format='%(refname:strip=2)' refs/tags > "$tmp/source-tags"
+          git ls-remote --tags github | awk '$2 !~ /\^\{\}$/ {print $2}' | sed 's#refs/tags/##' > "$tmp/target-tags"
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            if ! grep -Fxq -- "$tag" "$tmp/source-tags"; then
+              push_with_retry ":refs/tags/$tag"
+            fi
+          done < "$tmp/target-tags"
+
+      - name: Disable mirrored upstream workflows
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+          TARGET_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::UPSTREAM_SYNC_TOKEN is not set; cannot disable mirrored workflows"
+            exit 0
+          fi
+          gh api "repos/${TARGET_REPO}/actions/workflows" --paginate \
+            --jq '.workflows[] | select(.path != ".github/workflows/sync-upstream.yml") | .id' |
+          while IFS= read -r workflow_id; do
+            [ -z "$workflow_id" ] && continue
+            gh api -X PUT "repos/${TARGET_REPO}/actions/workflows/${workflow_id}/disable" || true
+          done
