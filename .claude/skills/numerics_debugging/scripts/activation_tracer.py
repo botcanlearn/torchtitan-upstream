@@ -872,7 +872,7 @@ class ActivationCaptureProfiler:
 
     def _setup(self) -> None:
         """Enter DebugModeTracer so the next training step is captured."""
-        from torchtitan.tools.logging import logger
+        from torchtitan.observability.logging import logger
 
         logger.info(f"Numerics capture: arming for step {self._capture_step}")
         set_numerics_capture_active(True)
@@ -881,7 +881,7 @@ class ActivationCaptureProfiler:
 
     def _dump(self) -> None:
         """Dump captures after the capture step completes."""
-        from torchtitan.tools.logging import logger
+        from torchtitan.observability.logging import logger
 
         # _teardown() exits the tracer.  DebugModeTracer populates
         # skipped_excluded_ops inside __exit__ (when operators are

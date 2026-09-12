@@ -12,17 +12,21 @@ trainer console logging in torchtitan/components/metrics.py.
 
 from __future__ import annotations
 
+import logging
+
 import re
 import sys
 from collections.abc import Sequence
 from typing import Any
 
-from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import Color, NoColor
 
 # Color cycle for the console output. Skip `black` (invisible on dark
 # terminals) and `white` (low-contrast on light terminals); `red` is
 # reserved for the leading "{prefix} | Step:" rendering.
+logger = logging.getLogger(__name__)
+
+
 _COLOR_CYCLE = [
     name
     for name in vars(Color)
