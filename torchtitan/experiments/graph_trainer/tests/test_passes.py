@@ -2449,7 +2449,9 @@ class TestFullMemoryPolicy(TestCase):
             full_recompute_save_ops="layers.*.moe.router.gate::aten.mm.default",
         )
 
-        with self.assertRaisesRegex(ValueError, "requires.*memory_policy full"):
+        with self.assertRaisesRegex(
+            ValueError, r"requires compile\.memory_policy='full'"
+        ):
             validate_memory_policy_config(compile_config)
 
     def test_invalid_save_op_selectors_rejected(self):
