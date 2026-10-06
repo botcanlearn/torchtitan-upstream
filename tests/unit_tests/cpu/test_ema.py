@@ -24,14 +24,20 @@ class TestEMADynamicDecay(unittest.TestCase):
     def test_default_n1_matches_closed_form(self):
         model = nn.Linear(4, 4)
         ema = EMA.Config().build(model_parts=[model])
-        expected = ema.optimizers[0].state[model.weight]["ema_params"].clone()
+        expected = (
+            ema.optimizers[0]
+            .state[model.weight]["ema_params"]["half_life_0p05"]
+            .clone()
+        )
         for step in range(1, 6):
             with torch.no_grad():
                 model.weight.fill_(float(step))
             ema.step(step)
             beta = 2.0 ** (-1.0 / (0.05 * step))
             expected = expected * beta + model.weight.detach() * (1 - beta)
-            actual = ema.optimizers[0].state[model.weight]["ema_params"]
+            actual = ema.optimizers[0].state[model.weight]["ema_params"][
+                "half_life_0p05"
+            ]
             torch.testing.assert_close(actual, expected, atol=1e-5, rtol=0)
 
     def test_update_every_n_steps_uses_firing_count_not_raw_steps(self):
@@ -40,7 +46,11 @@ class TestEMADynamicDecay(unittest.TestCase):
         intended whenever update_every_n_steps > 1."""
         model = nn.Linear(4, 4)
         ema = EMA.Config(update_every_n_steps=2).build(model_parts=[model])
-        expected = ema.optimizers[0].state[model.weight]["ema_params"].clone()
+        expected = (
+            ema.optimizers[0]
+            .state[model.weight]["ema_params"]["half_life_0p05"]
+            .clone()
+        )
         fire_count = 0
         for step in range(1, 11):
             with torch.no_grad():
@@ -51,7 +61,9 @@ class TestEMADynamicDecay(unittest.TestCase):
             fire_count += 1
             beta = 2.0 ** (-1.0 / (0.05 * fire_count))
             expected = expected * beta + model.weight.detach() * (1 - beta)
-            actual = ema.optimizers[0].state[model.weight]["ema_params"]
+            actual = ema.optimizers[0].state[model.weight]["ema_params"][
+                "half_life_0p05"
+            ]
             torch.testing.assert_close(actual, expected, atol=1e-5, rtol=0)
         self.assertEqual(fire_count, 5)
 
@@ -60,27 +72,35 @@ class TestEMADynamicDecay(unittest.TestCase):
         as if training had continued uninterrupted."""
         model = nn.Linear(4, 4)
         ema = EMA.Config(step_bias=6).build(model_parts=[model])
-        start = ema.optimizers[0].state[model.weight]["ema_params"].clone()
+        start = (
+            ema.optimizers[0]
+            .state[model.weight]["ema_params"]["half_life_0p05"]
+            .clone()
+        )
         with torch.no_grad():
             model.weight.fill_(7.0)
         ema.step(1)  # current_step=1, step_bias=6 -> num_updates = 7
         beta7 = 2.0 ** (-1.0 / (0.05 * 7))
         expected = start * beta7 + model.weight.detach() * (1 - beta7)
-        actual = ema.optimizers[0].state[model.weight]["ema_params"]
+        actual = ema.optimizers[0].state[model.weight]["ema_params"]["half_life_0p05"]
         torch.testing.assert_close(actual, expected, atol=1e-5, rtol=0)
 
     def test_fixed_decay_ignores_firing_count(self):
-        """A fixed `decay` bypasses the half-life schedule entirely -- same
+        """A fixed `decays` entry bypasses the half-life schedule entirely -- same
         value regardless of how many times it's fired."""
         model = nn.Linear(4, 4)
-        ema = EMA.Config(decay=0.9).build(model_parts=[model])
-        expected = ema.optimizers[0].state[model.weight]["ema_params"].clone()
+        ema = EMA.Config(decays=[0.9], half_life_fractions=[]).build(
+            model_parts=[model]
+        )
+        expected = (
+            ema.optimizers[0].state[model.weight]["ema_params"]["decay_0p9"].clone()
+        )
         for step in range(1, 4):
             with torch.no_grad():
                 model.weight.fill_(float(step))
             ema.step(step)
             expected = expected * 0.9 + model.weight.detach() * 0.1
-            actual = ema.optimizers[0].state[model.weight]["ema_params"]
+            actual = ema.optimizers[0].state[model.weight]["ema_params"]["decay_0p9"]
             torch.testing.assert_close(actual, expected, atol=1e-6, rtol=0)
 
     def test_start_step_does_not_double_count_first_firing(self):
@@ -90,13 +110,17 @@ class TestEMADynamicDecay(unittest.TestCase):
         start_step=10 does not fire and step 11 is firing number 1."""
         model = nn.Linear(4, 4)
         ema = EMA.Config(start_step=10).build(model_parts=[model])
-        expected = ema.optimizers[0].state[model.weight]["ema_params"].clone()
+        expected = (
+            ema.optimizers[0]
+            .state[model.weight]["ema_params"]["half_life_0p05"]
+            .clone()
+        )
 
         with torch.no_grad():
             model.weight.fill_(5.0)
         ema.step(10)  # elapsed == 0 -> no firing yet
         torch.testing.assert_close(
-            ema.optimizers[0].state[model.weight]["ema_params"],
+            ema.optimizers[0].state[model.weight]["ema_params"]["half_life_0p05"],
             expected,
             atol=0,
             rtol=0,
@@ -108,7 +132,9 @@ class TestEMADynamicDecay(unittest.TestCase):
             ema.step(step)
             beta = 2.0 ** (-1.0 / (0.05 * i))
             expected = expected * beta + model.weight.detach() * (1 - beta)
-            actual = ema.optimizers[0].state[model.weight]["ema_params"]
+            actual = ema.optimizers[0].state[model.weight]["ema_params"][
+                "half_life_0p05"
+            ]
             torch.testing.assert_close(actual, expected, atol=1e-5, rtol=0)
 
     def test_decay_schedule_survives_checkpoint_resume(self):
@@ -125,7 +151,11 @@ class TestEMADynamicDecay(unittest.TestCase):
             model.weight.fill_(1.0)
         for step in range(1, 2001):
             ema.step(step)
-        saved = ema.optimizers[0].state[model.weight]["ema_params"].clone()
+        saved = (
+            ema.optimizers[0]
+            .state[model.weight]["ema_params"]["half_life_0p05"]
+            .clone()
+        )
 
         ckpt_dir = tempfile.mkdtemp()
         try:
@@ -135,7 +165,7 @@ class TestEMADynamicDecay(unittest.TestCase):
             ema2 = EMA.Config().build(model_parts=[model2])
             dcp.load({"ema": ema2}, checkpoint_id=ckpt_dir)
             torch.testing.assert_close(
-                ema2.optimizers[0].state[model2.weight]["ema_params"],
+                ema2.optimizers[0].state[model2.weight]["ema_params"]["half_life_0p05"],
                 saved,
                 atol=1e-6,
                 rtol=0,
@@ -146,7 +176,9 @@ class TestEMADynamicDecay(unittest.TestCase):
             with torch.no_grad():
                 model2.weight.fill_(99.0)
             ema2.step(2001)
-            after = ema2.optimizers[0].state[model2.weight]["ema_params"]
+            after = ema2.optimizers[0].state[model2.weight]["ema_params"][
+                "half_life_0p05"
+            ]
             beta = 2.0 ** (-1.0 / (0.05 * 2001))
             expected = saved * beta + model2.weight.detach() * (1 - beta)
             torch.testing.assert_close(after, expected, atol=1e-5, rtol=0)
@@ -173,8 +205,12 @@ class TestEMADynamicDecay(unittest.TestCase):
                 model_b.weight.fill_(float(step))
             ema_a.step(step)
             ema_b.step(step)
-        val_a = ema_a.optimizers[0].state[model_a.weight]["ema_params"]
-        val_b = ema_b.optimizers[0].state[model_b.weight]["ema_params"]
+        val_a = ema_a.optimizers[0].state[model_a.weight]["ema_params"][
+            "half_life_0p05"
+        ]
+        val_b = ema_b.optimizers[0].state[model_b.weight]["ema_params"][
+            "half_life_0p05"
+        ]
         self.assertFalse(torch.equal(val_a, val_b))
 
 
@@ -216,7 +252,9 @@ class TestEMABufferSupport(unittest.TestCase):
         model = _ModelWithExpertBias()
         ema = EMA.Config(buffer_patterns=["expert_bias_E"]).build(model_parts=[model])
         expected = (
-            ema._buffer_optimizers[0].state[model.expert_bias_E]["ema_params"].clone()
+            ema._buffer_optimizers[0]
+            .state[model.expert_bias_E]["ema_params"]["half_life_0p05"]
+            .clone()
         )
         for step in range(1, 6):
             with torch.no_grad():
@@ -224,7 +262,9 @@ class TestEMABufferSupport(unittest.TestCase):
             ema.step(step)
             beta = 2.0 ** (-1.0 / (0.05 * step))
             expected = expected * beta + model.expert_bias_E.detach() * (1 - beta)
-            actual = ema._buffer_optimizers[0].state[model.expert_bias_E]["ema_params"]
+            actual = ema._buffer_optimizers[0].state[model.expert_bias_E]["ema_params"][
+                "half_life_0p05"
+            ]
             torch.testing.assert_close(actual, expected, atol=1e-5, rtol=0)
 
     def test_default_empty_patterns_leaves_buffers_untracked(self):
@@ -244,7 +284,9 @@ class TestEMABufferSupport(unittest.TestCase):
             model.expert_bias_E.fill_(3.0)
         ema.step(1)
         saved_buffer_ema = (
-            ema._buffer_optimizers[0].state[model.expert_bias_E]["ema_params"].clone()
+            ema._buffer_optimizers[0]
+            .state[model.expert_bias_E]["ema_params"]["half_life_0p05"]
+            .clone()
         )
 
         ckpt_dir = tempfile.mkdtemp()
@@ -253,7 +295,9 @@ class TestEMABufferSupport(unittest.TestCase):
             dcp.save(state_dict, checkpoint_id=ckpt_dir)
             # No separate "ema_buffer" key -- the buffer's FQN is folded into
             # the same flat state dict alongside parameter FQNs.
-            self.assertIn("state.expert_bias_E.ema_params", ema.state_dict())
+            self.assertIn(
+                "state.expert_bias_E.ema_params.half_life_0p05", ema.state_dict()
+            )
 
             model2 = _ModelWithExpertBias()
             ema2 = EMA.Config(buffer_patterns=["expert_bias_E"]).build(
@@ -263,7 +307,7 @@ class TestEMABufferSupport(unittest.TestCase):
 
             actual = ema2._buffer_optimizers[0].state[model2.expert_bias_E][
                 "ema_params"
-            ]
+            ]["half_life_0p05"]
             torch.testing.assert_close(actual, saved_buffer_ema, atol=1e-6, rtol=0)
         finally:
             shutil.rmtree(ckpt_dir, ignore_errors=True)
@@ -278,7 +322,9 @@ class TestEMABufferSupport(unittest.TestCase):
         self.assertEqual(len(ema._buffer_optimizers[1].state), 0)  # model_b: empty
 
         expected = (
-            ema._buffer_optimizers[0].state[model_a.expert_bias_E]["ema_params"].clone()
+            ema._buffer_optimizers[0]
+            .state[model_a.expert_bias_E]["ema_params"]["half_life_0p05"]
+            .clone()
         )
         for step in range(1, 6):
             with torch.no_grad():
@@ -288,7 +334,7 @@ class TestEMABufferSupport(unittest.TestCase):
             expected = expected * beta + model_a.expert_bias_E.detach() * (1 - beta)
             actual = ema._buffer_optimizers[0].state[model_a.expert_bias_E][
                 "ema_params"
-            ]
+            ]["half_life_0p05"]
             torch.testing.assert_close(actual, expected, atol=1e-5, rtol=0)
 
     def test_non_float_buffer_is_rejected(self):
@@ -321,7 +367,7 @@ class TestEMABufferSupport(unittest.TestCase):
             ema.step(step)
         for ema_opt in ema.optimizers:
             for param_state in ema_opt.state.values():
-                stored = param_state["ema_params"]
+                stored = param_state["ema_params"]["half_life_0p05"]
                 self.assertFalse(stored.requires_grad)
                 self.assertIsNone(stored.grad_fn)
 
@@ -395,25 +441,6 @@ class TestEMAWarnings(unittest.TestCase):
         self.assertIn("discards all EMA history", joined)
         self.assertIn("exclude_from_loading", joined)
 
-    def test_half_life_fraction_with_fixed_decay_warns(self):
-        """A fixed decay replaces the half-life schedule, so setting both
-        means half_life_fraction silently does nothing."""
-        with self.assertLogs(
-            "torchtitan.components.optim.ema", level="WARNING"
-        ) as logs:
-            EMA.Config(decay=0.9, half_life_fraction=0.42)
-        joined = "\n".join(logs.output)
-        self.assertIn("half_life_fraction", joined)
-        self.assertIn("ignored", joined)
-
-    def test_fixed_decay_alone_does_not_warn(self):
-        with self.assertNoLogs("torchtitan.components.optim.ema", level="WARNING"):
-            EMA.Config(decay=0.9)
-
-    def test_half_life_fraction_alone_does_not_warn(self):
-        with self.assertNoLogs("torchtitan.components.optim.ema", level="WARNING"):
-            EMA.Config(half_life_fraction=0.42)
-
     def test_low_precision_tracking_warns(self):
         """bfloat16 has 8 mantissa bits, so the per-firing increment rounds
         away and the EMA never moves."""
@@ -444,7 +471,9 @@ class TestEMAWarnings(unittest.TestCase):
             # num_updates is derived from the step, so this is firing 10000:
             # decay = 2 ** (-1 / (0.05 * 10000)), i.e. an increment of ~1.4e-3
             ema.step(10000)
-            stored = ema.optimizers[0].state[model.weight]["ema_params"]
+            stored = ema.optimizers[0].state[model.weight]["ema_params"][
+                "half_life_0p05"
+            ]
             moved[dtype] = stored.flatten()[0].float().item() - 1.0
         self.assertGreater(moved[torch.float32], 0.0)
         self.assertEqual(moved[torch.bfloat16], 0.0)
@@ -460,13 +489,13 @@ class TestEMAConfigValidation(unittest.TestCase):
     def test_non_positive_half_life_fraction_is_rejected(self):
         for bad in (0.0, -0.05):
             with self.subTest(half_life_fraction=bad), self.assertRaises(ValueError):
-                EMA.Config(half_life_fraction=bad)
+                EMA.Config(half_life_fractions=[bad])
 
     def test_decay_outside_unit_interval_is_rejected(self):
         # decay=1.0 is rejected because it never updates the EMA at all.
         for bad in (-1.0, 1.0, 2.0):
             with self.subTest(decay=bad), self.assertRaises(ValueError):
-                EMA.Config(decay=bad)
+                EMA.Config(decays=[bad])
 
     def test_negative_step_bias_is_rejected(self):
         # step_bias is added to the firing count; a non-positive count gives
@@ -479,19 +508,19 @@ class TestEMAConfigValidation(unittest.TestCase):
         # nan slips past a `<= 0` guard and silently makes the whole EMA nan.
         nan, inf = float("nan"), float("inf")
         for kwargs in (
-            {"half_life_fraction": nan},
-            {"half_life_fraction": inf},
-            {"decay": nan},
-            {"decay": inf},
+            {"half_life_fractions": [nan]},
+            {"half_life_fractions": [inf]},
+            {"decays": [nan]},
+            {"decays": [inf]},
         ):
             with self.subTest(**kwargs), self.assertRaises(ValueError):
                 EMA.Config(**kwargs)
 
     def test_valid_values_are_accepted(self):
         EMA.Config()
-        EMA.Config(decay=0.0)
-        EMA.Config(decay=0.999)
-        EMA.Config(update_every_n_steps=4, half_life_fraction=0.1)
+        EMA.Config(decays=[0.0])
+        EMA.Config(decays=[0.999])
+        EMA.Config(update_every_n_steps=4, half_life_fractions=[0.1])
         # negative start_step only shifts the schedule, so it stays allowed
         EMA.Config(start_step=-100)
 

@@ -70,7 +70,7 @@ class TestEMACpuOffload(unittest.TestCase):
         ema = EMA.Config(offload_to_cpu=True).build(model_parts=[model])
         for ema_opt in ema.optimizers:
             for param_state in ema_opt.state.values():
-                t = param_state["ema_params"]
+                t = param_state["ema_params"]["half_life_0p05"]
                 self.assertFalse(t.is_cuda)
                 self.assertTrue(t.is_pinned())
 
@@ -78,7 +78,7 @@ class TestEMACpuOffload(unittest.TestCase):
         model = self._build_sharded_model()
         ema = EMA.Config(offload_to_cpu=True).build(model_parts=[model])
         initial = {
-            id(p): st["ema_params"].clone()
+            id(p): st["ema_params"]["half_life_0p05"].clone()
             for opt in ema.optimizers
             for p, st in opt.state.items()
         }
@@ -94,7 +94,7 @@ class TestEMACpuOffload(unittest.TestCase):
                     1 - beta
                 )
                 torch.testing.assert_close(
-                    st["ema_params"], expected, atol=1e-4, rtol=0
+                    st["ema_params"]["half_life_0p05"], expected, atol=1e-4, rtol=0
                 )
 
     def test_scratch_buffer_reused_across_steps(self):
@@ -157,7 +157,7 @@ class TestEMACpuOffload(unittest.TestCase):
                 param.fill_(1.0)
         for ema_opt in ema.optimizers:
             for param_state in ema_opt.state.values():
-                param_state["ema_params"].fill_(0.0)
+                param_state["ema_params"]["half_life_0p05"].fill_(0.0)
         torch.cuda.synchronize()
 
         # hold the offload stream so its read of the params happens late
@@ -173,7 +173,7 @@ class TestEMACpuOffload(unittest.TestCase):
         # value the offload stream read: 1.0 if ordered, ~9.0 if it raced.
         for ema_opt in ema.optimizers:
             for param_state in ema_opt.state.values():
-                mean = param_state["ema_params"].float().mean().item()
+                mean = param_state["ema_params"]["half_life_0p05"].float().mean().item()
                 self.assertLess(
                     mean,
                     2.0,
@@ -217,7 +217,7 @@ class TestEMACpuOffload(unittest.TestCase):
         self.assertTrue(exported)
         for ema_opt in ema.optimizers:
             for param_state in ema_opt.state.values():
-                stored = param_state["ema_params"]
+                stored = param_state["ema_params"]["half_life_0p05"]
                 self.assertNotIsInstance(stored, DTensor)
                 self.assertEqual(stored.device.type, "cpu")
                 self.assertTrue(stored.is_pinned())
@@ -248,7 +248,7 @@ class TestEMACpuOffload(unittest.TestCase):
         self.assertGreaterEqual(calls["n"], 3)
         for ema_opt in ema.optimizers:
             for param_state in ema_opt.state.values():
-                stored = param_state["ema_params"]
+                stored = param_state["ema_params"]["half_life_0p05"]
                 self.assertNotIsInstance(stored, DTensor)
                 self.assertTrue(stored.is_pinned())
         # both training and saving must still work afterwards
@@ -276,16 +276,16 @@ class TestEMACpuOffload(unittest.TestCase):
         self.assertEqual(results[True], "tolerated")
 
     def test_offload_state_dict_key_layout_matches_super(self):
-        """The offload load path looks up "state.{fqn}.ema_params" directly, so
-        that layout must stay the one OptimizersContainer.state_dict()
-        produces."""
+        """The offload load path looks up "state.{fqn}.ema_params.{ema_key}"
+        directly, so that layout must stay the one
+        OptimizersContainer.state_dict() produces."""
         model = self._build_sharded_model()
         offloaded = EMA.Config(offload_to_cpu=True).build(model_parts=[model])
         plain = EMA.Config(offload_to_cpu=False).build(model_parts=[model])
         self.assertEqual(sorted(offloaded.state_dict()), sorted(plain.state_dict()))
         self.assertTrue(
             all(
-                key.startswith("state.") and key.endswith(".ema_params")
+                key.startswith("state.") and key.endswith(".ema_params.half_life_0p05")
                 for key in offloaded.state_dict()
             )
         )
@@ -311,10 +311,12 @@ class TestEMACpuOffload(unittest.TestCase):
 
             for opt1, opt2 in zip(ema.optimizers, ema2.optimizers):
                 for (_, st1), (_, st2) in zip(opt1.state.items(), opt2.state.items()):
-                    v2 = st2["ema_params"]
+                    v2 = st2["ema_params"]["half_life_0p05"]
                     self.assertFalse(v2.is_cuda)
                     self.assertTrue(v2.is_pinned())
-                    torch.testing.assert_close(st1["ema_params"], v2, atol=1e-6, rtol=0)
+                    torch.testing.assert_close(
+                        st1["ema_params"]["half_life_0p05"], v2, atol=1e-6, rtol=0
+                    )
         finally:
             shutil.rmtree(ckpt_dir, ignore_errors=True)
 
@@ -340,7 +342,9 @@ class TestEMACpuOffload(unittest.TestCase):
         ema = EMA.Config(
             offload_to_cpu=True, buffer_patterns=[r"expert_bias_E$"]
         ).build(model_parts=[model])
-        bias_state = ema._buffer_optimizers[0].state[model.expert_bias_E]["ema_params"]
+        bias_state = ema._buffer_optimizers[0].state[model.expert_bias_E]["ema_params"][
+            "half_life_0p05"
+        ]
         self.assertFalse(bias_state.is_cuda)
         self.assertTrue(bias_state.is_pinned())
 
@@ -348,7 +352,9 @@ class TestEMACpuOffload(unittest.TestCase):
             model.expert_bias_E.fill_(2.0)
         ema.step(1)
         torch.cuda.synchronize()
-        bias_state = ema._buffer_optimizers[0].state[model.expert_bias_E]["ema_params"]
+        bias_state = ema._buffer_optimizers[0].state[model.expert_bias_E]["ema_params"][
+            "half_life_0p05"
+        ]
 
         ckpt_dir = tempfile.mkdtemp()
         try:
@@ -360,7 +366,9 @@ class TestEMACpuOffload(unittest.TestCase):
             ).build(model_parts=[model2])
             dcp.load({"ema": ema2}, checkpoint_id=ckpt_dir)
 
-            v2 = ema2._buffer_optimizers[0].state[model2.expert_bias_E]["ema_params"]
+            v2 = ema2._buffer_optimizers[0].state[model2.expert_bias_E]["ema_params"][
+                "half_life_0p05"
+            ]
             self.assertFalse(v2.is_cuda)
             self.assertTrue(v2.is_pinned())
             torch.testing.assert_close(bias_state, v2, atol=1e-6, rtol=0)

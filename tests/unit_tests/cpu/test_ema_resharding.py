@@ -119,7 +119,7 @@ class TestEMACheckpointResharding(DTensorTestBase):
 
         # a value that differs per row, so a mis-assembled reshard is visible
         expected = torch.arange(64, dtype=torch.float32).reshape(8, 8)
-        stored = ema.optimizers[0].state[model.weight]["ema_params"]
+        stored = ema.optimizers[0].state[model.weight]["ema_params"]["half_life_0p05"]
         with torch.no_grad():
             stored.to_local().copy_(
                 distribute_tensor(expected, mesh, [Shard(0)]).to_local()
@@ -134,10 +134,17 @@ class TestEMACheckpointResharding(DTensorTestBase):
         # Read the same checkpoint back into plain whole tensors -- a layout
         # nothing wrote. DCP can only do this if the saved shards carry their
         # global coordinates, which is what "resharding-safe" means here.
-        target = {"ema.state.weight.ema_params": torch.zeros(8, 8, dtype=torch.float32)}
+        target = {
+            "ema.state.weight.ema_params.half_life_0p05": torch.zeros(
+                8, 8, dtype=torch.float32
+            )
+        }
         dcp.load(target, checkpoint_id=checkpoint)
         torch.testing.assert_close(
-            target["ema.state.weight.ema_params"], expected, rtol=0, atol=0
+            target["ema.state.weight.ema_params.half_life_0p05"],
+            expected,
+            rtol=0,
+            atol=0,
         )
 
     @with_comms
@@ -159,7 +166,9 @@ class TestEMACheckpointResharding(DTensorTestBase):
         model.expert_bias_E = distribute_tensor(model.expert_bias_E, mesh, [Shard(0)])
         ema = EMA.Config(buffer_patterns=[r"expert_bias_E$"]).build(model_parts=[model])
         expected = torch.arange(8, dtype=torch.float32)
-        stored = ema._buffer_optimizers[0].state[model.expert_bias_E]["ema_params"]
+        stored = ema._buffer_optimizers[0].state[model.expert_bias_E]["ema_params"][
+            "half_life_0p05"
+        ]
         with torch.no_grad():
             stored.to_local().copy_(
                 distribute_tensor(expected, mesh, [Shard(0)]).to_local()
@@ -171,11 +180,16 @@ class TestEMACheckpointResharding(DTensorTestBase):
         dcp.save({"ema": ema}, checkpoint_id=checkpoint)
 
         target = {
-            "ema.state.expert_bias_E.ema_params": torch.zeros(8, dtype=torch.float32)
+            "ema.state.expert_bias_E.ema_params.half_life_0p05": torch.zeros(
+                8, dtype=torch.float32
+            )
         }
         dcp.load(target, checkpoint_id=checkpoint)
         torch.testing.assert_close(
-            target["ema.state.expert_bias_E.ema_params"], expected, rtol=0, atol=0
+            target["ema.state.expert_bias_E.ema_params.half_life_0p05"],
+            expected,
+            rtol=0,
+            atol=0,
         )
 
 
@@ -228,7 +242,7 @@ class TestEMAMultiRankLifecycle(DTensorTestBase):
         # the on-disk tensor must be the global one, not a shard
         metadata = dcp.FileSystemReader(folder[0]).read_metadata()
         for key, item in metadata.state_dict_metadata.items():
-            if key.endswith(".ema_params"):
+            if key.endswith(".ema_params.half_life_0p05"):
                 self.assertEqual(tuple(item.size), (4, 8))
 
         fresh_model = self._sharded_model()
@@ -298,7 +312,11 @@ class TestEMAHsdpPlacements(DTensorTestBase):
             model.weight.fill_(5.0)
         for step in range(1, 4):
             ema.step(step)
-        local = ema.optimizers[0].state[model.weight]["ema_params"].to_local()
+        local = (
+            ema.optimizers[0]
+            .state[model.weight]["ema_params"]["half_life_0p05"]
+            .to_local()
+        )
 
         # gather across the replicate axis; every replica must agree exactly
         replicate_group = mesh.get_group("dp_replicate")

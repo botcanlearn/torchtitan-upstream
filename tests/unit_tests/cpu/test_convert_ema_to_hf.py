@@ -98,10 +98,10 @@ class TestConvertEmaToHf(unittest.TestCase):
                     buf.fill_(self.buffer_trained)
         for ema_opt in ema._param_optimizers:
             for param_state in ema_opt.state.values():
-                param_state["ema_params"].fill_(AVERAGED)
+                param_state["ema_params"]["half_life_0p05"].fill_(AVERAGED)
         for ema_opt in ema._buffer_optimizers:
             for param_state in ema_opt.state.values():
-                param_state["ema_params"].fill_(self.buffer_averaged)
+                param_state["ema_params"]["half_life_0p05"].fill_(self.buffer_averaged)
 
         ckpt = str(Path(self.tmp) / "step-1")
         states = {"ema": ema}
@@ -235,8 +235,8 @@ class TestConvertEmaToHf(unittest.TestCase):
         ckpt, _ = self._write_checkpoint()
         real = self.module._ema_state_dict
 
-        def with_a_bogus_key(ema):
-            state = real(ema)
+        def with_a_bogus_key(ema, ema_key):
+            state = real(ema, ema_key)
             state["layers.0.not_a_real_state_dict_key.weight"] = next(
                 iter(state.values())
             )
@@ -381,7 +381,7 @@ class TestConvertEmaToHfFrozenParameters(unittest.TestCase):
         )
         for ema_opt in ema.optimizers:
             for param_state in ema_opt.state.values():
-                param_state["ema_params"].fill_(AVERAGED)
+                param_state["ema_params"]["half_life_0p05"].fill_(AVERAGED)
 
         ckpt = str(Path(self.tmp) / "step-1")
         states = {"ema": ema}
