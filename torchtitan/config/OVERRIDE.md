@@ -478,6 +478,13 @@ for the full recipe.
   while retaining the core `DenseFeedForward` parameter layout and checkpoint
   behavior. Because the override targets `SwiGLU.Config`, it also applies to
   grouped experts and dist-GEMM feed-forwards that use that activation.
+- `torchtitan_recipes/overrides/triton_rms_norm.py` -- **a custom Triton norm
+  example.** It replaces every exact `RMSNorm.Config` (decoder norms and QK
+  norms) with `TritonRMSNorm`, which keeps the `nn.RMSNorm` parameter layout and
+  accumulates the sum of squares in FP32 with Kahan compensation (FP64 with
+  `use_kahan_summation=False`). The kernels are
+  registered as `torch.library.custom_op`s with fake and autograd registrations.
+  It runs as a local SPMD region typed by the norm's own `ShardingConfig`.
 The `TritonRoPE` snippets above are illustrative — no `triton_rope.py` is
 shipped — but RoPE is a fully valid override target: each attention module owns a
 `rope` submodule (`RoPE.Config`), so a custom RoPE is an ordinary component override.
