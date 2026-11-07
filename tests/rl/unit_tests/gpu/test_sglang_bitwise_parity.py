@@ -175,7 +175,8 @@ class SGLangBitwiseParityTestBase(unittest.TestCase):
 
     def _generate(self, prompt_ids: list[list[int]]) -> list[FinishedRequest]:
         """Sample a completion of each prompt at temperature 1, each with its own seed
-        and session, and return the results in prompt order."""
+        and session, and return the results in prompt order. Equal prompts form one
+        rollout group."""
         requests = []
         for i, ids in enumerate(prompt_ids):
             request = EngineRequest(
@@ -187,7 +188,7 @@ class SGLangBitwiseParityTestBase(unittest.TestCase):
                     seed=1000 + i,
                     stop_token_ids=[],
                 ),
-                group_id=i,
+                group_id=prompt_ids.index(ids),
                 routing_session_id=str(i),
                 arrival_time=time.time(),
             )
