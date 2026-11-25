@@ -156,7 +156,8 @@ class TorchTitanGPUModelRunner(GPUModelRunner):
             mode            GDN with drafts must not run inside a piecewise graph: its piecewise
                             capture has no metadata, so it would replay zeros. A requested FULL
                             must stay FULL (vLLM lowers it when a backend lacks ALWAYS support)
-            drafter graphs  TorchTitanEagleProposer.dummy_run captures them under FULL
+            drafter graphs  under a requested FULL, the drafter must be breakable, or it runs
+                            eagerly; TorchTitanEagleProposer.dummy_run captures its graphs
         """
         drafts = self.uniform_decode_query_len > 1
         if drafts and self._linear_attention_builders():
@@ -166,13 +167,24 @@ class TorchTitanGPUModelRunner(GPUModelRunner):
                 and resolved_mode != CUDAGraphMode.FULL
             ):
                 raise RuntimeError(
-                    "GDN with drafts can't run inside piecewise CUDA graphs (resolved mode "
-                    f"{resolved_mode}, requested {self.requested_cudagraph_mode}); a requested "
-                    "FULL also needs every attention backend at AttentionCGSupport.ALWAYS"
+                    f"GDN with drafts can't run under cudagraph_mode {resolved_mode} (requested "
+                    f"{self.requested_cudagraph_mode}): it must not run inside piecewise graphs, "
+                    "and a requested FULL must stay FULL. vLLM lowers FULL when an attention "
+                    "backend lacks AttentionCGSupport.ALWAYS"
                 )
-        graph_memory = super().capture_model()
 
         drafter = getattr(self, "drafter", None)
+        if (
+            drafter is not None
+            and self.requested_cudagraph_mode == CUDAGraphMode.FULL
+            and not isinstance(drafter.model, BreakableCUDAGraphWrapper)
+        ):
+            raise RuntimeError(
+                "cuda_graph.mode='FULL' with drafts needs VLLM_USE_BREAKABLE_CUDAGRAPH=1 before vLLM "
+                "imports its attention op (VLLMEngine sets it); the MTP drafter would run eagerly"
+            )
+        graph_memory = super().capture_model()
+
         if drafter is not None and isinstance(drafter.model, BreakableCUDAGraphWrapper):
             expected = {
                 descriptor
