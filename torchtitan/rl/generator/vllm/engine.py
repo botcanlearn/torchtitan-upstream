@@ -268,10 +268,11 @@ class VLLMEngine(GenerationEngine):
           acceptance can fall as the policy drifts.
         - With `session_kv_holder`, prefix hits keep the last block that vLLM drops by
           default for drafts (see `_build_engine_args`).
-        - With `cuda_graph.mode="FULL"`, every target step replays a FULL graph and the
-          drafter replays piecewise graphs (`VLLMCudaGraphConfig.mode`).
+        - With `cuda_graph.mode="FULL"`, every target step up to the largest capture size
+          replays a FULL graph; the drafter replays piecewise graphs (`VLLMCudaGraphConfig.mode`).
         - Not supported with `debug.batch_invariant`, generator data parallelism > 1,
-          models with a vision encoder or non-CUDA devices."""
+          models with a vision encoder or non-CUDA devices. `add_requests` rejects
+          1-token prompts."""
 
         @property
         def uses_mooncake_store(self) -> bool:
@@ -346,6 +347,9 @@ class VLLMEngine(GenerationEngine):
                 "with kernels the trainer does not run"
             )
         if config.num_speculative_tokens > 0 and parallelism.data_parallel_degree > 1:
+            # TODO: support drafts at DP > 1 once tested: a rank's verify graph padded to a peer's size
+            # takes the packed graph (TorchTitanLinearAttentionMetadataBuilder._build_with_drafts), and
+            # idle ranks run dummy batches.
             raise ValueError(
                 f"num_speculative_tokens={config.num_speculative_tokens} needs "
                 f"data_parallel_degree=1, got {parallelism.data_parallel_degree}: drafts at "
@@ -651,15 +655,27 @@ class VLLMEngine(GenerationEngine):
         rejected_requests: list[tuple[str, Exception]] = []
         for request in requests:
             # Rejected, not raised: the request's `generate` call fails and the engine keeps
-            # serving. Both checks run before LLMEngine.add_request registers the request,
+            # serving. These checks run before LLMEngine.add_request registers the request,
             # so a rejection leaves no engine state:
+            #   - a 1-token prompt with drafts (below);
             #   - `_preprocess_images`: no vision processor, or an image file does not decode;
             #   - vLLM's validation (prompt length, sampling params, token ids): render_cmpl
             #     and InputProcessor.process_inputs raise VLLMClientError (not a ValueError
             #     subclass) or ValueError (recheck on a vLLM upgrade).
-            # Both are deterministic and rank 0 broadcasts the same requests to every TP
+            # All are deterministic and rank 0 broadcasts the same requests to every TP
             # rank, so all ranks reject the same ones; otherwise their collectives hang.
             try:
+                # With drafts, vLLM pads a 1-token prompt with placeholder drafts, which GDN's
+                # verify kernels can't run (TorchTitanLinearAttentionMetadataBuilder raises).
+                if (
+                    self.config.num_speculative_tokens > 0
+                    and len(request.prompt.token_ids) < 2
+                ):
+                    raise ValueError(
+                        f"{request.request_id} has a 1-token prompt, which "
+                        f"num_speculative_tokens={self.config.num_speculative_tokens} "
+                        "does not support"
+                    )
                 sampling_params = _build_sampling_params(request.sampling)
                 if self._coordinate_kv_offload:
                     # shared_request_id is a copy of Titan's request.request_id,

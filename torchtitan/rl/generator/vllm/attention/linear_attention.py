@@ -37,6 +37,8 @@ from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
 
 class LinearAttentionExecutionPath(Enum):
     SINGLE_TOKEN = auto()
+    # Without drafts: chunk kernel + decode kernel for 1-token rows. With drafts: prefill kernels on
+    # every token, verify kernels on the first S tokens (see `_build_with_drafts`).
     PACKED = auto()
     # Drafts only: every row runs vLLM's verify kernels (rows with drafts, 1-token rows after context).
     VERIFY = auto()
@@ -83,8 +85,8 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
     threshold (1 + k with drafts, else 1).
     """
 
-    # TODO: drop the subclass once vLLM's runner passes draft counts to any builder that asks
-    # for them; today it picks builders by class (GPUModelRunner._build_attention_metadata).
+    # TODO: with the move to vLLM's V2 model runner, drop the subclass if V2 passes draft counts to
+    # any builder that asks. V1 passes them only to known builder classes (GPUModelRunner._build_attention_metadata).
 
     supports_update_block_table = True
 
@@ -352,6 +354,8 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 (num_decode_draft_tokens >= 0) & (context_lens == 0)
             )
             if no_context_draft_rows.size:
+                # TODO: run such a row on the prefill kernels and drop its placeholder drafts' states.
+                # VLLMEngine.add_requests rejects 1-token prompts with drafts, so this is a backstop.
                 raise RuntimeError(
                     f"Row {int(no_context_draft_rows[0])} has drafts but no context: a 1-token "
                     "prompt that vLLM's scheduler padded with placeholder drafts. GDN's verify "
@@ -368,8 +372,8 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             )
         runs_prefill_kernels = ~runs_verify_kernels & (query_lens > 0)
 
-        # A replayed graph decides first: an idle DP rank's uniform dummy batch can replay
-        # the packed graph.
+        # A replayed graph decides first (an idle DP rank's dummy batch can replay the packed graph;
+        # VLLMEngine rejects drafts at DP > 1 today).
         if self.replays_packed_graph:
             path = LinearAttentionExecutionPath.PACKED
         elif self.replays_uniform_graph or self.dummy_run_uniform:
