@@ -200,6 +200,7 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
         num_actual_tokens = gdn_metadata.num_actual_tokens
         if num_actual_tokens == 0:
             return mixed_qkv.new_zeros(output_shape)
+
         if self.num_speculative_tokens:
             output = self._forward_speculative(
                 mixed_qkv[:num_actual_tokens],
@@ -217,6 +218,7 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
                 )
                 output = torch.cat([output, padding])
             return output
+
         state_indices = gdn_metadata.non_spec_state_indices_tensor
         cu_seqlens = gdn_metadata.non_spec_query_start_loc
         has_initial_state = gdn_metadata.has_initial_state
@@ -364,6 +366,7 @@ class VLLMInnerGDN(InnerAttention, MambaBase):
             raise RuntimeError(
                 "GDN with drafts needs TorchTitanLinearAttentionMetadataBuilder's draft metadata"
             )
+
         if metadata.execution_path is LinearAttentionExecutionPath.VERIFY:
             # vLLM's conv update writes its output over its input.
             conv_output = causal_conv1d_update(

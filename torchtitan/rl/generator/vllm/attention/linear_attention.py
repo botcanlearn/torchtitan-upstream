@@ -83,8 +83,8 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
     threshold (1 + k with drafts, else 1).
     """
 
-    # TODO: drop the subclass once vLLM's runner passes draft counts to builders that ask for
-    # them, not by isinstance (GPUModelRunner._build_attention_metadata).
+    # TODO: drop the subclass once vLLM's runner passes draft counts to any builder that asks
+    # for them; today it picks builders by class (GPUModelRunner._build_attention_metadata).
 
     supports_update_block_table = True
 
@@ -340,6 +340,7 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                         "on steps without drafts (TorchTitanGPUModelRunner)"
                     )
                 num_accepted_tokens = self.runner_num_accepted_tokens
+
             if m.seq_lens_cpu_upper_bound is None:
                 raise RuntimeError(
                     "Linear attention (GDN) with drafts needs seq_lens_cpu_upper_bound "

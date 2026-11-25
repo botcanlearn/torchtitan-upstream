@@ -49,7 +49,7 @@ class TorchTitanCudagraphDispatcher(CudagraphDispatcher):
         longer from 32 sequences at head dim 64 and from 64 at head dim 128
         (GB300, 16-token pages).
       - With k drafts, a decode batch verifies 1 + k tokens per row: GDN runs only its
-        verify kernels, FA4 its verify-as-decode call.
+        verify kernels, and FA4 its verify-step path (``TorchTitanVarlenInnerAttentionImpl.forward``).
 
     Uniform-decode batch in FULL mode:
       num_tokens <= max_decode_capture_size              -> decode graph
