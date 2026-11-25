@@ -158,6 +158,10 @@ def test_gdn_full_runner_matches_eager(
     assert len({tuple(step["slots"]) for step in replayed}) > 1
     if num_speculative_tokens:
         assert any(step["path"] == "VERIFY" for step in replayed)
+        # A verify row resumed after accepting drafts, so it read its state past slot 0.
+        assert any(
+            max(step["accepted"]) > 1 for step in replayed if step["path"] == "VERIFY"
+        )
         assert any(
             step["kind"] == "mixed" and step["path"] == "PACKED" for step in replayed
         )
@@ -371,8 +375,9 @@ def run_engine(
             max_num_seqs=4,
             max_num_batched_tokens=256,
             # PyTorch's FA2 paged-KV kernel on A10G requires 256-token pages.
-            # Preserve 32 blocks so all four sequences can run concurrently. With drafts, each
-            # sequence holds 1 + k state blocks in each of the 3 GDN groups.
+            # Room for all four sequences at once. Without drafts: 1 KV block + 1 state block in each
+            # of the 3 GDN groups, 4 x 4 = 16 of 32. With 3 drafts, 1 + 3 state blocks per group:
+            # 4 x 13 = 52, plus the null block, of 64.
             block_size=256,
             num_gpu_blocks_override=64 if drafts else 32,
             gpu_memory_utilization=0.25,
@@ -469,6 +474,11 @@ def run_engine(
                 actual=offsets[-1],
                 path=first.execution_path.name,
                 initial=first.has_initial_state.cpu().tolist()[: len(requests)],
+                accepted=(
+                    first.num_accepted_tokens.cpu().tolist()[: len(requests)]
+                    if drafts
+                    else []
+                ),
             )
             result["dispatch"].append(record)
             return value
@@ -482,10 +492,11 @@ def run_engine(
     base = engine.renderer.tokenizer.encode(
         "Explain physics.", add_special_tokens=False
     )
-    waves = [([11, 17, 23, 37], 4), ([129], 1), ([9, 13, 29, 41], 3)]
-    # Fresh 1-token prompts. With drafts, vLLM pads them with placeholder drafts, which GDN rejects.
+    # Then fresh 1-token prompts: one alone, then one that arrives while another runs. With drafts,
+    # vLLM pads that second one with placeholder drafts, which GDN rejects.
+    waves = [([11, 17, 23, 37], 4), ([129], 1), ([9, 13, 29, 41], 3), ([1], 1)]
     if not drafts:
-        waves += [([1], 1), ([1, 1], 1)]
+        waves.append(([1, 1], 1))
     for wave, (lengths, initial_count) in enumerate(waves):
         prompts = engine.renderer.render_cmpl(
             [{"prompt_token_ids": (base * length)[:length]} for length in lengths]
