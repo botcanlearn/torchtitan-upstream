@@ -291,12 +291,14 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         seqused_k = attn_metadata.seq_lens
 
         # Every row holds max_seqlen_q tokens, e.g. a verify step: one token plus its drafts
-        # (FULL graphs pad with whole rows). No row is a single-token decode row.
+        # (FULL graphs pad with whole rows). With max_seqlen_q > 1, no row is a single-token
+        # decode row, so the decode/prefill split below has nothing to split.
         is_uniform = num_actual_tokens == max_seqlen_q * seqused_k.shape[0]
         # TODO: once the FA4 floor has SwapAB token mode (Dao-AILab/flash-attention#3217), the
-        # plain varlen call serves verify rows; keep this path only for shapes token mode refuses
-        # (qpk * n <= 32 < npo2(qpk) * npo2(n), e.g. qpk 6 at k = 4). If FA4 declines token mode,
-        # fuse the tail and the merge into one Triton kernel.
+        # plain varlen call serves verify rows. Keep this path only for rows token mode refuses:
+        # over 32 columns once query heads per KV head and tokens per row are each rounded up to a
+        # power of two (6 query heads per KV head at 5 tokens: 8 x 8 = 64). If FA4 declines token
+        # mode, fuse the tail and the merge into one Triton kernel.
         if (
             is_uniform
             and max_seqlen_q == self.verify_query_len
