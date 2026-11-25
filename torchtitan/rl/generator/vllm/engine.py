@@ -155,8 +155,10 @@ def _enable_breakable_cuda_graphs() -> None:
     vLLM makes its attention op a graph break when it imports the op, and only if this
     variable is set then. Raises if the op was imported before.
     """
-    # TODO: drop the variable and the import check once vLLM takes breakable CUDA graphs as a
-    # CompilationConfig field (no vLLM issue filed yet).
+    # TODO: drop the import check once the pin reaches vLLM v0.33+, where graph breaks are
+    # decided at call time (our pin, vLLM 9f03b510c from 2026-09-13, decides them at import).
+    # Keep the variable until vLLM honors an explicit CompilationConfig.use_breakable_cudagraph
+    # (https://github.com/felipemello1/vllm/issues/3).
     os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
     from vllm.compilation import breakable_cudagraph
     from vllm.model_executor.layers.attention import attention as vllm_attention
