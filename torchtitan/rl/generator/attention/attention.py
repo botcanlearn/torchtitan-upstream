@@ -61,10 +61,11 @@ def paged_varlen_attention_out(
         # TODO: call torch's `varlen_attn_out` with fp8 descales once pytorch/pytorch#206590
         # lands; until then, call FA4's private `_flash_attn_fwd` with the arguments torch's FA4
         # bridge passes (torch/nn/attention/_fa4.py).
-        # TODO: raise the FA4 floor to the first release with fp8 SwapAB and its token mode
-        # (Dao-AILab/flash-attention#3217). FA4 4.0.0b40 runs fp8 decode and verify rows on its
-        # standard kernel: decode is 1.2x slower than bf16 SwapAB when requests share prefix
-        # pages; fp8 SwapAB is 1.7x faster than bf16 SwapAB there (GB300).
+        # TODO: raise the FA4 floor to the first release with fp8 SwapAB, its token mode
+        # (Dao-AILab/flash-attention#3217) and uncopied broadcast descales
+        # (Dao-AILab/flash-attention#OUT_PR). FA4 4.0.0b40 runs fp8 rows on its standard kernel,
+        # 1.2x slower than bf16 SwapAB on shared prefix pages (fp8 SwapAB: 1.7x faster than bf16
+        # SwapAB, GB300), and copies each expanded descale: 3 copy kernels, ~5 us per layer.
         from flash_attn.cute.interface import _flash_attn_fwd, TensorwiseScales
 
         window_left, window_right = window_size
