@@ -150,12 +150,11 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         self.zero_state_block_column = torch.zeros(
             self.num_reqs_capacity, 1, device=device, dtype=torch.long
         )
-        # TorchTitanGPUModelRunner sets these before each build: whether the step replays a
-        # FULL graph captured for packed batches, or a uniform one (every row 1 + k tokens).
+        # TorchTitanGPUModelRunner._determine_batch_execution_and_padding sets these before each build:
+        # whether the step replays a packed or a uniform FULL graph, and in dummy runs whether the
+        # dummy batch is uniform (None on real steps).
         self.replays_packed_graph = False
         self.replays_uniform_graph = False
-        # TorchTitanGPUModelRunner._dummy_run sets this for its duration: whether its batch
-        # is uniform. None on real steps.
         self.dummy_run_uniform: bool | None = None
         # TorchTitanGPUModelRunner.initialize_metadata_builders sets this to the runner's accepted
         # counts, which vLLM keeps current on every step but passes to build() only with drafts.
@@ -641,7 +640,7 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         if self.use_spec_decode and self.dummy_run_uniform is None:
             raise RuntimeError(
                 "Linear attention (GDN) capture with drafts needs "
-                "TorchTitanGPUModelRunner._dummy_run to set dummy_run_uniform"
+                "TorchTitanGPUModelRunner._determine_batch_execution_and_padding to set dummy_run_uniform"
             )
         # vLLM's FULL dummy runs build here too. At DP>1 a one-token dummy can replay
         # the mixed-batch graph at any padded size, so stage the packed buffers.
