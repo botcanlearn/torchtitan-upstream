@@ -290,16 +290,16 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         max_seqlen_q = attn_metadata.max_query_len
         seqused_k = attn_metadata.seq_lens
 
-        # A verify step: every row holds one token plus its drafts (FULL graphs pad with whole rows).
-        # TODO: run each verify row as one FA4 call, without the fp32 tail, once torch's varlen
-        # API passes FA4's query_len_in_heads (Dao-AILab/flash-attention#3217 adds it to FA4; no
-        # torch issue filed yet).
-        is_uniform_verify = (
-            max_seqlen_q == self.verify_query_len
-            and num_actual_tokens == max_seqlen_q * seqused_k.shape[0]
-        )
+        # Every row holds max_seqlen_q tokens, e.g. a verify step: one token plus its drafts
+        # (FULL graphs pad with whole rows). No row is a single-token decode row.
+        is_uniform = num_actual_tokens == max_seqlen_q * seqused_k.shape[0]
+        # TODO: once the FA4 floor has SwapAB token mode (Dao-AILab/flash-attention#3217), the
+        # plain varlen call serves verify rows; keep this path only for shapes token mode refuses
+        # (qpk * n <= 32 < npo2(qpk) * npo2(n), e.g. qpk 6 at k = 4). If FA4 declines token mode,
+        # fuse the tail and the merge into one Triton kernel.
         if (
-            is_uniform_verify
+            is_uniform
+            and max_seqlen_q == self.verify_query_len
             and seqused_k.shape[0] >= _MIN_VERIFY_ROWS_ON_DECODE_KERNEL
             and current_flash_attention_impl() == "FA4"
             and sliding_window_size == (-1, 0)
@@ -317,6 +317,7 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         if (
             current_flash_attention_impl() == "FA4"
             and max_seqlen_q > 1
+            and not is_uniform
             and self.out_transform is None
         ):
             is_single_token = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]) == 1
@@ -422,9 +423,9 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         ).permute(3, 0, 1, 2)
 
         # ======== The last n - 1 keys, causal among the row's tokens ========
-        # TODO: one Triton kernel for this tail and the merge. These ~15 small kernels add 53-71 us
-        # per layer at 1-4 rows and 1.2 ms per Qwen3.8-27B verify step at 26 rows (GB300), which keeps
-        # steps under _MIN_VERIFY_ROWS_ON_DECODE_KERNEL rows off this path.
+        # These ~15 small kernels add 53-71 us per layer at 1-4 rows and 1.2 ms per Qwen3.8-27B
+        # verify step at 26 rows (GB300), which keeps steps under
+        # _MIN_VERIFY_ROWS_ON_DECODE_KERNEL rows off this path.
         # vLLM's merge_attn_states takes token-major outputs of one dtype: here that costs
         # three layout copies and a bf16 tail, for ~5 fewer kernels.
         tail_positions_RI = num_shared_keys_R[:, None] + torch.arange(

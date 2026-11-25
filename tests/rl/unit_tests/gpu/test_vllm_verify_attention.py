@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from torchtitan.rl.generator.vllm.attention import attention
 from torchtitan.rl.generator.vllm.attention.attention import (
     TorchTitanVarlenInnerAttentionImpl,
 )
@@ -24,18 +25,20 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize(
-    "query_lens, seq_lens, is_uniform_verify",
+    "query_lens, seq_lens, is_uniform_verify, num_fa4_calls",
     [
         # 8 rows of 1 + 3 tokens; the 30k row gets KV splits; a padded row (seq_len 0).
-        ([4] * 8, [4, 130, 1000, 257, 30_000, 0, 513, 2_048], True),
-        # Fewer than 8 verify rows: FA4's varlen call.
-        ([4, 4, 4], [130, 30_000, 257], True),
+        ([4] * 8, [4, 130, 1000, 257, 30_000, 0, 513, 2_048], True, 1),
+        # Fewer than 8 verify rows: one FA4 varlen call.
+        ([4, 4, 4], [130, 30_000, 257], True, 1),
         # A leading 1-token row: FA4's decode call for it, the varlen call for the rest.
-        ([1, 4, 4], [257, 130, 30_000], False),
+        ([1, 4, 4], [257, 130, 30_000], False, 2),
     ],
     ids=["verify", "few_rows", "mixed"],
 )
-def test_forward_matches_causal_attention(query_lens, seq_lens, is_uniform_verify):
+def test_forward_matches_causal_attention(
+    query_lens, seq_lens, is_uniform_verify, num_fa4_calls
+):
     """Each query token attends causally to its row's keys, through the impl's dispatch.
 
     vLLM passes max_model_len as max_seq_len when it captures FULL graphs.
@@ -106,11 +109,17 @@ def test_forward_matches_causal_attention(query_lens, seq_lens, is_uniform_verif
         patch.object(
             impl, "_verify_rows_as_decode", wraps=impl._verify_rows_as_decode
         ) as verify_rows_as_decode,
+        patch.object(
+            attention,
+            "paged_varlen_attention_out",
+            wraps=attention.paged_varlen_attention_out,
+        ) as fa4_calls,
     ):
         impl.forward(layer, query, None, None, kv_cache, metadata, output=output)
     # 8: the impl's row cutoff (`_MIN_VERIFY_ROWS_ON_DECODE_KERNEL`).
     takes_decode_kernel = is_uniform_verify and len(query_lens) >= 8
     assert verify_rows_as_decode.called == takes_decode_kernel
+    assert fa4_calls.call_count == num_fa4_calls
 
     for row, (num_queries, num_keys) in enumerate(zip(query_lens, seq_lens)):
         if num_keys == 0:
