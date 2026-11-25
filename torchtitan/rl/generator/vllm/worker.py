@@ -152,31 +152,26 @@ class TorchTitanGPUModelRunner(GPUModelRunner):
         self.requested_cudagraph_mode = self.compilation_config.cudagraph_mode
 
     def capture_model(self) -> int:
-        """Check the settings GDN's FULL graphs with drafts rely on, capture, then check the
-        drafter's graphs.
+        """Check the graph mode GDN with drafts relies on, capture, then check the drafter's
+        graphs.
 
-            mode            vLLM can turn FULL into FULL_AND_PIECEWISE; GDN's piecewise
-                            capture has no metadata, so its graphs would replay zeros
-            reorder         rows with at most 1 + k tokens must lead every batch
+            mode            GDN with drafts must not run inside a piecewise graph: its piecewise
+                            capture has no metadata, so it would replay zeros. A requested FULL
+                            must stay FULL (vLLM lowers it when a backend lacks ALWAYS support)
             drafter graphs  TorchTitanEagleProposer.dummy_run captures them under FULL
         """
         drafts = self.uniform_decode_query_len > 1
         if drafts and self._linear_attention_builders():
             resolved_mode = self.compilation_config.cudagraph_mode
-            if (
+            if resolved_mode.has_piecewise_cudagraphs() or (
                 self.requested_cudagraph_mode == CUDAGraphMode.FULL
                 and resolved_mode != CUDAGraphMode.FULL
             ):
                 raise RuntimeError(
-                    f"vLLM resolved cudagraph_mode FULL to {resolved_mode}, which GDN with "
-                    "drafts doesn't support: an attention backend reports less than "
+                    f"GDN with drafts can't run under cudagraph_mode {resolved_mode} "
+                    f"(requested {self.requested_cudagraph_mode}): it needs FULL graphs "
+                    "without piecewise ones, and every attention backend at "
                     "AttentionCGSupport.ALWAYS"
-                )
-            if self.reorder_batch_threshold != self.uniform_decode_query_len:
-                raise RuntimeError(
-                    f"GDN with drafts needs a batch-reorder threshold of "
-                    f"{self.uniform_decode_query_len} (1 + k); the attention builders give "
-                    f"{self.reorder_batch_threshold}"
                 )
         graph_memory = super().capture_model()
 
@@ -200,6 +195,21 @@ class TorchTitanGPUModelRunner(GPUModelRunner):
                 )
             logger.info("MTP drafter captured %d CUDA graphs", len(captured))
         return graph_memory
+
+    def calculate_reorder_batch_threshold(self) -> None:
+        super().calculate_reorder_batch_threshold()
+        # With drafts, GDN's verify kernels read only the first tokens of a step, so rows with
+        # at most 1 + k tokens must lead every batch (TorchTitanLinearAttentionMetadataBuilder).
+        if (
+            self.uniform_decode_query_len > 1
+            and self._linear_attention_builders()
+            and self.reorder_batch_threshold != self.uniform_decode_query_len
+        ):
+            raise RuntimeError(
+                f"GDN with drafts needs a batch-reorder threshold of "
+                f"{self.uniform_decode_query_len} (1 + k); the attention builders give "
+                f"{self.reorder_batch_threshold}"
+            )
 
     def _linear_attention_builders(
         self,

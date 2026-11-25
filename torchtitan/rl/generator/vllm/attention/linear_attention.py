@@ -308,9 +308,9 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             PACKED  any other step: prefill kernels on every token, verify kernels on the first S
 
         The batch puts rows with context and at most 1 + k tokens first (the runner's reorder
-        threshold, checked in `TorchTitanGPUModelRunner.capture_model`), so the rows that run
-        the verify kernels end within S. Dummy runs ignore vLLM's stale counts: null slots,
-        accepted counts of 1.
+        threshold, checked in `TorchTitanGPUModelRunner.calculate_reorder_batch_threshold`), so
+        the rows that run the verify kernels end within S. Dummy runs ignore vLLM's stale counts:
+        null slots, accepted counts of 1.
         """
         num_reqs = m.num_reqs
         num_tokens = m.num_actual_tokens
