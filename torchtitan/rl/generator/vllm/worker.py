@@ -60,8 +60,9 @@ class TorchTitanCudagraphDispatcher(CudagraphDispatcher):
     replay and graph ownership stay intact.
 
     This costs one additional graph capture per decode-specialized batch size
-    (83 at max_num_seqs 1024); ``TorchTitanGPUModelRunner.initialize_kv_cache``
-    keeps them out of vLLM's graph-memory estimate.
+    (83 at max_num_seqs 1024; with 3 drafts, 145 verify graphs at max_num_seqs 512).
+    Without drafts, ``TorchTitanGPUModelRunner.initialize_kv_cache`` keeps them out of
+    vLLM's graph-memory estimate.
 
     TODO: drop this class once vLLM captures FULL decode graphs next to FULL mixed
     graphs without piecewise compilation.
@@ -255,14 +256,18 @@ class TorchTitanGPUModelRunner(GPUModelRunner):
         self, kv_cache_config, is_profiling: bool = False, **kwargs
     ):
         super().initialize_kv_cache(kv_cache_config, is_profiling, **kwargs)
-        # vLLM's graph-memory estimate, taken out of the KV cache, charges every FULL graph
-        # like the second largest (a mixed graph). Decode graphs take far less (Qwen3-8B TP2:
-        # 11 decode graphs added 0.03 GiB to 1.57), so profile the mixed graphs only. vLLM drops
-        # these profiling keys afterwards; the real call rebuilds them, decode keys included
-        # (test_generator_dp_cudagraph.py checks a decode graph still replays).
+        # vLLM's graph-memory estimate, taken out of the KV cache, charges every FULL graph like
+        # the second largest (a mixed graph). 1-token decode graphs take far less (Qwen3-8B TP2:
+        # 11 added 0.03 GiB to 1.57), so profile the mixed graphs only; the real call rebuilds the
+        # decode keys (test_generator_dp_cudagraph.py). Graphs that verify 1 + k tokens per row stay
+        # charged: 300 estimated at 7.60 GiB, 6.97 GiB captured (Qwen3.8-27B, k = 3, 512 seqs, GB300).
         # TODO: drop once vLLM's estimate charges decode graphs at their own size.
         dispatcher = self.cudagraph_dispatcher
-        if is_profiling and dispatcher.cudagraph_mode == CUDAGraphMode.FULL:
+        if (
+            is_profiling
+            and dispatcher.cudagraph_mode == CUDAGraphMode.FULL
+            and self.uniform_decode_query_len == 1
+        ):
             keys = dispatcher.cudagraph_keys
             keys[CUDAGraphMode.FULL] = {
                 key for key in keys[CUDAGraphMode.FULL] if not key.uniform
