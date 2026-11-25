@@ -166,10 +166,9 @@ class TorchTitanGPUModelRunner(GPUModelRunner):
                 and resolved_mode != CUDAGraphMode.FULL
             ):
                 raise RuntimeError(
-                    f"GDN with drafts can't run under cudagraph_mode {resolved_mode} "
-                    f"(requested {self.requested_cudagraph_mode}): it needs FULL graphs "
-                    "without piecewise ones, and every attention backend at "
-                    "AttentionCGSupport.ALWAYS"
+                    "GDN with drafts can't run inside piecewise CUDA graphs (resolved mode "
+                    f"{resolved_mode}, requested {self.requested_cudagraph_mode}); a requested "
+                    "FULL also needs every attention backend at AttentionCGSupport.ALWAYS"
                 )
         graph_memory = super().capture_model()
 
@@ -273,11 +272,10 @@ class TorchTitanGPUModelRunner(GPUModelRunner):
         self, kv_cache_config, is_profiling: bool = False, **kwargs
     ):
         super().initialize_kv_cache(kv_cache_config, is_profiling, **kwargs)
-        # vLLM's graph-memory estimate, taken out of the KV cache, charges every FULL graph like
-        # the second largest (a mixed graph). 1-token decode graphs take far less (Qwen3-8B TP2:
-        # 11 added 0.03 GiB to 1.57), so profile the mixed graphs only; the real call rebuilds the
-        # decode keys (test_generator_dp_cudagraph.py). Graphs that verify 1 + k tokens per row stay
-        # charged: 300 estimated at 7.60 GiB, 6.97 GiB captured (Qwen3.8-27B, k = 3, 512 seqs, GB300).
+        # vLLM charges every FULL graph like the second largest (a mixed graph). 1-token decode graphs take
+        # far less (Qwen3-8B TP2: 11 added 0.03 GiB to 1.57), so profile only the mixed graphs; the real call
+        # rebuilds the decode keys (test_generator_dp_cudagraph.py). Verify graphs (1 + k tokens per row) stay
+        # charged: left out, 145 of them put the capture 0.79 GiB over the estimate (Qwen3.8-27B, k = 3, GB300).
         # TODO: drop once vLLM's estimate charges decode graphs at their own size.
         dispatcher = self.cudagraph_dispatcher
         if (
