@@ -1183,22 +1183,20 @@ def test_full_mode_decode_dispatch(
 @pytest.mark.parametrize(
     "graph_mode, mixed_step",
     [
-        (CUDAGraphMode.FULL_AND_PIECEWISE, (CUDAGraphMode.PIECEWISE, False)),
+        (CUDAGraphMode.FULL, (CUDAGraphMode.FULL, False)),
         (CUDAGraphMode.FULL_DECODE_ONLY, (CUDAGraphMode.NONE, False)),
     ],
 )
 def test_runner_replays_the_verify_graph_only_when_every_row_verifies(
-    monkeypatch, graph_mode, mixed_step
+    graph_mode, mixed_step
 ):
     """k = 3, 4 rows of 4 tokens each:
 
-                                                         FULL_AND_PIECEWISE   FULL_DECODE_ONLY
-    draft counts [3, 3, 3, 3]                            FULL, uniform        FULL, uniform
-    draft counts [3, 3, 3, -1] (a 4-token prefill row)   PIECEWISE            NONE
-    a step without drafts, after an all-verify step      PIECEWISE            NONE
+                                                         FULL                FULL_DECODE_ONLY
+    draft counts [3, 3, 3, 3]                            FULL, uniform       FULL, uniform
+    draft counts [3, 3, 3, -1] (a 4-token prefill row)   FULL, mixed graph   NONE
+    a step without drafts, after an all-verify step      FULL, mixed graph   NONE
     """
-    # FULL_AND_PIECEWISE under CompilationMode.NONE needs breakable graphs: vLLM's config check rejects it otherwise.
-    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
     config = VllmConfig(device_config=DeviceConfig(device="cpu"))
     config.speculative_config = SimpleNamespace(
         num_speculative_tokens=3, parallel_drafting=False

@@ -45,6 +45,9 @@ MODEL_ENV = "TORCHTITAN_QWEN3_5_0_8B_HF_PATH"
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
+# TODO: add an MTP drafts case (Qwen3.5-0.8B has one MTP layer): greedy FULL vs NONE streams and the
+# "MTP drafter captured" log line. It would cover the runner's drafter capture and graph-mode checks,
+# and vLLM's real accepted counts, which today only engine starts exercise. Not run yet on CI's A10G.
 @pytest.mark.parametrize(
     "batch_invariant", [False, True], ids=["regular", "batch-invariant"]
 )
