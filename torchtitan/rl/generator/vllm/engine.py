@@ -230,20 +230,6 @@ class VLLMEngine(GenerationEngine):
         `VLLMSessionKVHolder`). With SimpleCPU offload configured, also send CPU
         cache release hints when sessions end. None disables both behaviors."""
 
-        @property
-        def uses_mooncake_store(self) -> bool:
-            return isinstance(self.kv_offload, MooncakeStoreKVOffloadConfig)
-
-        def __post_init__(self):
-            if (
-                isinstance(self.kv_offload, SimpleCPUKVOffloadConfig)
-                and self.extra_engine_args.get("enable_prefix_caching") is False
-            ):
-                raise ValueError(
-                    "SimpleCPUOffloadConnector requires prefix caching: it saves and "
-                    "loads KV blocks by their prefix hashes."
-                )
-
         num_speculative_tokens: int = 0
         """Tokens the checkpoint's MTP head drafts per decode step; 0: off. The target
         verifies them with rejection sampling, so the output follows the target's
@@ -259,8 +245,21 @@ class VLLMEngine(GenerationEngine):
         - Not supported with `cuda_graph.mode="FULL"` (use FULL_DECODE_ONLY),
           `debug.batch_invariant`, models with a vision encoder or non-CUDA devices."""
 
+        @property
+        def uses_mooncake_store(self) -> bool:
+            return isinstance(self.kv_offload, MooncakeStoreKVOffloadConfig)
+
         def __post_init__(self) -> None:
             GenerationEngine.Config.__post_init__(self)
+            if (
+                isinstance(self.kv_offload, SimpleCPUKVOffloadConfig)
+                and self.extra_engine_args.get("enable_prefix_caching") is False
+            ):
+                raise ValueError(
+                    "SimpleCPUOffloadConnector requires prefix caching: it saves and "
+                    "loads KV blocks by their prefix hashes."
+                )
+
             if self.num_speculative_tokens < 0:
                 raise ValueError(
                     f"num_speculative_tokens must be >= 0, got {self.num_speculative_tokens}"
