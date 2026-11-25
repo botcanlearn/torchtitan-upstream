@@ -1228,7 +1228,7 @@ def test_runner_replays_the_verify_graph_only_when_every_row_verifies(
     runner.cudagraph_dispatcher.initialize_cudagraph_keys(graph_mode, 4)
 
     def dispatch_step(num_decode_draft_tokens: list[int] | None):
-        # vLLM's _prepare_inputs writes the draft counts only on steps with drafts (None: none).
+        # vLLM's _prepare_inputs writes the draft counts only on steps with drafts (None: a step without drafts).
         def prepare_inputs(self, scheduler_output, num_scheduled_tokens):
             if scheduler_output.scheduled_spec_decode_tokens:
                 self.num_decode_draft_tokens.np[:4] = num_decode_draft_tokens
