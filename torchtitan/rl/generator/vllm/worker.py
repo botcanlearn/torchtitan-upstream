@@ -222,9 +222,10 @@ class TorchTitanGPUModelRunner(GPUModelRunner):
         With k drafts, a real step replays a uniform graph only if every row verifies k drafts:
 
             k = 3, 4 tokens per row, draft counts [3, 3, 3, 3]   -> uniform graph
-            k = 3, 4 tokens per row, draft counts [3, 3, 3, -1]  -> mixed graph (a 4-token prefill)
+            k = 3, 4 tokens per row, draft counts [3, 3, 3, -1]  -> not the uniform graph (a 4-token prefill)
         """
         self.get_model().set_num_valid_tokens(num_tokens)
+
         # vLLM calls a step uniform when every row has 1 + k tokens. Its GDN builder refills a
         # uniform graph's buffers only when every row verifies, so a 1 + k token prefill row
         # would replay it on the last verify step's slots and accepted counts.

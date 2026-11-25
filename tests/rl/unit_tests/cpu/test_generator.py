@@ -1180,12 +1180,22 @@ def test_full_mode_decode_dispatch(
     assert (mode, descriptor.uniform) == expected
 
 
-def test_runner_replays_the_verify_graph_only_when_every_row_verifies(monkeypatch):
-    """k = 3, 4 rows of 4 tokens each, FULL_AND_PIECEWISE:
+@pytest.mark.parametrize(
+    "graph_mode, mixed_step",
+    [
+        (CUDAGraphMode.FULL_AND_PIECEWISE, (CUDAGraphMode.PIECEWISE, False)),
+        (CUDAGraphMode.FULL_DECODE_ONLY, (CUDAGraphMode.NONE, False)),
+    ],
+)
+def test_runner_replays_the_verify_graph_only_when_every_row_verifies(
+    monkeypatch, graph_mode, mixed_step
+):
+    """k = 3, 4 rows of 4 tokens each:
 
-    draft counts [3, 3, 3, 3]                            -> FULL, uniform (verify graph)
-    draft counts [3, 3, 3, -1] (a 4-token prefill row)   -> PIECEWISE
-    a step without drafts, after an all-verify step      -> PIECEWISE
+                                                         FULL_AND_PIECEWISE   FULL_DECODE_ONLY
+    draft counts [3, 3, 3, 3]                            FULL, uniform        FULL, uniform
+    draft counts [3, 3, 3, -1] (a 4-token prefill row)   PIECEWISE            NONE
+    a step without drafts, after an all-verify step      PIECEWISE            NONE
     """
     # FULL_AND_PIECEWISE under CompilationMode.NONE needs breakable graphs: vLLM's config check rejects it otherwise.
     monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
@@ -1195,7 +1205,7 @@ def test_runner_replays_the_verify_graph_only_when_every_row_verifies(monkeypatc
     )
     config.compilation_config = CompilationConfig(
         mode=CompilationMode.NONE,
-        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        cudagraph_mode=graph_mode,
         cudagraph_capture_sizes=[4, 8, 16],
         max_cudagraph_capture_size=16,
     )
@@ -1215,9 +1225,7 @@ def test_runner_replays_the_verify_graph_only_when_every_row_verifies(monkeypatc
     runner.uniform_decode_query_len = 4
     runner.num_decode_draft_tokens = SimpleNamespace(np=np.full(4, -1, dtype=np.int32))
     runner.cudagraph_dispatcher = TorchTitanCudagraphDispatcher(config)
-    runner.cudagraph_dispatcher.initialize_cudagraph_keys(
-        CUDAGraphMode.FULL_AND_PIECEWISE, 4
-    )
+    runner.cudagraph_dispatcher.initialize_cudagraph_keys(graph_mode, 4)
 
     def dispatch_step(num_decode_draft_tokens: list[int] | None):
         # vLLM's _prepare_inputs writes the draft counts only on steps with drafts (None: none).
@@ -1240,9 +1248,9 @@ def test_runner_replays_the_verify_graph_only_when_every_row_verifies(monkeypatc
         return mode, descriptor.uniform
 
     assert dispatch_step([3, 3, 3, 3]) == (CUDAGraphMode.FULL, True)
-    assert dispatch_step([3, 3, 3, -1]) == (CUDAGraphMode.PIECEWISE, False)
+    assert dispatch_step([3, 3, 3, -1]) == mixed_step
     dispatch_step([3, 3, 3, 3])
-    assert dispatch_step(None) == (CUDAGraphMode.PIECEWISE, False)
+    assert dispatch_step(None) == mixed_step
 
 
 def test_only_weights_use_cumem_allocator(monkeypatch):
