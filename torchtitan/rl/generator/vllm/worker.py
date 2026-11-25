@@ -66,8 +66,6 @@ class TorchTitanCudagraphDispatcher(CudagraphDispatcher):
 
     TODO: drop this class once vLLM captures FULL decode graphs next to FULL mixed
     graphs without piecewise compilation.
-    TODO: test drafts at DP > 1 (a rank's verify graph padded to a peer's size, idle
-    ranks' dummy batches); only one GPU has run them.
     """
 
     def initialize_cudagraph_keys(
