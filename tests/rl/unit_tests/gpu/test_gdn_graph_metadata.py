@@ -659,6 +659,7 @@ def test_verify_rows_match_single_token_decodes(num_accepted) -> None:
         ("decode", "prefill"),
         ("decode",),
         ("trimmed", "verify", "prefill"),
+        ("trimmed", "decode", "prefill"),
     ],
     ids="+".join,
 )
@@ -670,6 +671,8 @@ def test_speculative_step_matches_step_without_drafts(kinds) -> None:
         decode:                    a decode-only step
         trimmed, verify, prefill:  the scheduler trimmed the 1-token row's drafts; its last
                                    verify accepted 3, so it reads its state from slot 3
+        trimmed, decode, prefill:  no row has drafts, so vLLM passes no accepted counts; the
+                                   trimmed row's slot 3 comes from the runner's counts
 
     Requests come in vLLM's order: up to 1 + k tokens first, then prefills. The reference
     step runs the verify row's 4 tokens as one chunk. Outputs, SSM states and conv states
@@ -1109,7 +1112,7 @@ def _draft_step(
     """Build one step, as vLLM's runner does, one row per request.
 
     slots                 each request's 1 + k state slots; rows that run the verify kernels use all
-    num_accepted_tokens   what each request's last step accepted
+    num_accepted_tokens   what each request's last step accepted, passed only if a row has drafts
     num_tokens            the padded token count
     """
     query_start_loc = torch.tensor([0, *query_lens], dtype=torch.int32).cumsum(0).int()
@@ -1129,11 +1132,16 @@ def _draft_step(
     )
     if capture:
         return builder.build_for_cudagraph_capture(common)
+
+    # As TorchTitanGPUModelRunner hands its accepted counts to the builder.
+    builder.runner_num_accepted_tokens = torch.tensor(
+        num_accepted_tokens, device="cuda", dtype=torch.int32
+    )
+    if all(count < 0 for count in num_draft_tokens):
+        return builder.build(0, common)
     return builder.build(
         0,
         common,
-        num_accepted_tokens=torch.tensor(
-            num_accepted_tokens, device="cuda", dtype=torch.int32
-        ),
+        num_accepted_tokens=builder.runner_num_accepted_tokens,
         num_decode_draft_tokens_cpu=torch.tensor(num_draft_tokens, dtype=torch.int32),
     )

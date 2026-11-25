@@ -155,6 +155,9 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         # TorchTitanGPUModelRunner._dummy_run sets this for its duration: whether its batch
         # is uniform. None on real steps.
         self.dummy_run_uniform: bool | None = None
+        # TorchTitanGPUModelRunner.initialize_metadata_builders sets this to the runner's accepted
+        # counts, which vLLM keeps current on every step but passes to build() only with drafts.
+        self.runner_num_accepted_tokens: torch.Tensor | None = None
         if self.use_spec_decode:
             # The parent's spec_* buffers have decode_cudagraph_max_bs rows, which can be fewer
             # than a packed graph's request rows; these replace them under the same names.
@@ -328,23 +331,24 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 if num_decode_draft_tokens_cpu is None
                 else num_decode_draft_tokens_cpu[:num_reqs].numpy()
             )
+            # A step whose drafts the scheduler all trimmed: a 1-token row that resumes after
+            # accepting j > 1 tokens still reads its state from slot j.
             if num_accepted_tokens is None:
-                # TODO: vLLM passes accepted counts only on steps with drafts, so here a 1-token row
-                # that resumes after accepting j > 1 tokens reads the state after its first token
-                # (vLLM's builder too). Rare: only when the token budget trims every draft.
-                runs_verify_kernels = np.zeros(num_reqs, dtype=bool)
-            else:
-                if m.seq_lens_cpu_upper_bound is None:
+                if self.runner_num_accepted_tokens is None:
                     raise RuntimeError(
-                        "Linear attention (GDN) with drafts needs seq_lens_cpu_upper_bound "
-                        "to find the 1-token rows that resume a state"
+                        "Linear attention (GDN) with drafts needs the runner's accepted counts "
+                        "on steps without drafts (TorchTitanGPUModelRunner)"
                     )
-                context_lens = (
-                    m.seq_lens_cpu_upper_bound[:num_reqs].numpy() - query_lens
+                num_accepted_tokens = self.runner_num_accepted_tokens
+            if m.seq_lens_cpu_upper_bound is None:
+                raise RuntimeError(
+                    "Linear attention (GDN) with drafts needs seq_lens_cpu_upper_bound "
+                    "to find the 1-token rows that resume a state"
                 )
-                runs_verify_kernels = (num_decode_draft_tokens >= 0) | (
-                    (query_lens == 1) & (context_lens > 0)
-                )
+            context_lens = m.seq_lens_cpu_upper_bound[:num_reqs].numpy() - query_lens
+            runs_verify_kernels = (num_decode_draft_tokens >= 0) | (
+                (query_lens == 1) & (context_lens > 0)
+            )
             if self.replays_uniform_graph:
                 self._check_uniform_rows(query_lens, num_decode_draft_tokens)
             self._check_verify_kernel_rows_fit(

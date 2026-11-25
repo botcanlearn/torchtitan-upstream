@@ -196,6 +196,15 @@ class TorchTitanGPUModelRunner(GPUModelRunner):
             logger.info("MTP drafter captured %d CUDA graphs", len(captured))
         return graph_memory
 
+    def initialize_metadata_builders(
+        self, kv_cache_config, kernel_block_sizes: list[int]
+    ) -> None:
+        super().initialize_metadata_builders(kv_cache_config, kernel_block_sizes)
+        # vLLM passes accepted counts to builders only on steps with drafts, but keeps this buffer
+        # current on every step. GDN with drafts reads it on steps whose drafts were all trimmed.
+        for builder in self._linear_attention_builders():
+            builder.runner_num_accepted_tokens = self.num_accepted_tokens.gpu
+
     def calculate_reorder_batch_threshold(self) -> None:
         super().calculate_reorder_batch_threshold()
         # With drafts, GDN's verify kernels read only the first tokens of a step, so rows with
