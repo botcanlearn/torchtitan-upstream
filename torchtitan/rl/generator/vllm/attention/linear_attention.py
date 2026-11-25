@@ -346,6 +346,17 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                     "to find the 1-token rows that resume a state"
                 )
             context_lens = m.seq_lens_cpu_upper_bound[:num_reqs].numpy() - query_lens
+
+            no_context_draft_rows = np.flatnonzero(
+                (num_decode_draft_tokens >= 0) & (context_lens == 0)
+            )
+            if no_context_draft_rows.size:
+                raise RuntimeError(
+                    f"Row {int(no_context_draft_rows[0])} has drafts but no context: a 1-token "
+                    "prompt that vLLM's scheduler padded with placeholder drafts. GDN's verify "
+                    "kernels would read its slot's old state, so it is not supported"
+                )
+
             runs_verify_kernels = (num_decode_draft_tokens >= 0) | (
                 (query_lens == 1) & (context_lens > 0)
             )
@@ -482,17 +493,11 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         )
         if late_rows.size:
             row = int(late_rows[0])
-            # TODO: vLLM's scheduler pads a 1-token waiting prompt to 1 + k tokens with
-            # placeholder drafts. Without context it sorts after the prefills, and inside the
-            # first tokens the verify kernels would read its slot's old state (stock vLLM too).
-            # Zeroing its first spec slot first would fix both; RL prompts are never 1 token.
             raise RuntimeError(
                 f"Row {row} runs GDN's verify kernels (it has drafts, or 1 token after context) "
                 f"but ends at token {int(query_start_loc_cpu[row + 1])}, past the "
                 f"{num_verify_tokens} tokens those kernels see. Rows with context and at most "
-                "1 + k tokens should lead the batch (reorder threshold 1 + k). A 1-token prompt "
-                "without context, padded with placeholder drafts, sorts after the prefills: not "
-                "supported"
+                "1 + k tokens should lead the batch (reorder threshold 1 + k)"
             )
 
     def _stage_decode_split(

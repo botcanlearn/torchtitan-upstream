@@ -835,6 +835,17 @@ def test_draft_steps_replay_one_packed_graph() -> None:
             num_accepted_tokens=[1, 2],
             num_tokens=num_tokens,
         )
+    # A 1-token prompt padded with placeholder drafts, inside the first 16 tokens.
+    with pytest.raises(RuntimeError, match="Row 1 has drafts but no context"):
+        _draft_step(
+            graph_builder,
+            query_lens=[4, 4],
+            context_lens=[40, 0],
+            slots=slots[:2],
+            num_draft_tokens=[3, 3],
+            num_accepted_tokens=[2, 1],
+            num_tokens=num_tokens,
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
