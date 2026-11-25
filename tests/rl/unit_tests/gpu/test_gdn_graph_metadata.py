@@ -73,7 +73,7 @@ def test_gdn_supports_eager_and_full_decode_only_modes(graph_mode):
         mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
     )
 
-    TorchTitanLinearAttentionMetadataBuilder(spec, [], config, torch.device("cpu"))
+    _linear_builder(config, spec)
 
     dispatcher = TorchTitanCudagraphDispatcher(config)
     dispatcher.initialize_cudagraph_keys(graph_mode)
@@ -147,9 +147,7 @@ def test_full_metadata_and_native_dispatch_variants():
         dtypes=(torch.bfloat16, torch.float32),
         mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
     )
-    builder = TorchTitanLinearAttentionMetadataBuilder(
-        spec, [], config, torch.device("cpu")
-    )
+    builder = _linear_builder(config, spec)
     offsets = torch.tensor([0, 1, 2], dtype=torch.int32)
     common = CommonAttentionMetadata(
         query_start_loc=offsets,
@@ -278,10 +276,7 @@ def test_update_block_table_matches_build(step, mode):
         dtypes=(torch.bfloat16, torch.float32),
         mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
     )
-    first, other, reference = (
-        TorchTitanLinearAttentionMetadataBuilder(spec, [], config, torch.device("cpu"))
-        for _ in range(3)
-    )
+    first, other, reference = (_linear_builder(config, spec) for _ in range(3))
     replays_packed_graph = step in ("padded_single_token", "packed_graph_single_token")
     for builder in (first, other, reference):
         builder.replays_packed_graph = replays_packed_graph
@@ -340,14 +335,16 @@ def test_update_block_table_matches_build(step, mode):
 
 
 @pytest.mark.parametrize(
-    "mode, uniform, replays_packed_graph",
+    "mode, uniform, replays_packed_graph, replays_uniform_graph",
     [
-        (CUDAGraphMode.FULL, False, True),
-        (CUDAGraphMode.FULL, True, False),
-        (CUDAGraphMode.NONE, False, False),
+        (CUDAGraphMode.FULL, False, True, False),
+        (CUDAGraphMode.FULL, True, False, True),
+        (CUDAGraphMode.NONE, False, False, False),
     ],
 )
-def test_runner_tells_builders_the_selected_graph(mode, uniform, replays_packed_graph):
+def test_runner_tells_builders_the_selected_graph(
+    mode, uniform, replays_packed_graph, replays_uniform_graph
+):
     builder, other_builder = SimpleNamespace(), SimpleNamespace()
     runner = cast(Any, object.__new__(TorchTitanGPUModelRunner))
     runner.get_model = lambda: SimpleNamespace(set_num_valid_tokens=lambda n: None)
@@ -366,6 +363,7 @@ def test_runner_tells_builders_the_selected_graph(mode, uniform, replays_packed_
     ):
         runner._determine_batch_execution_and_padding(4, 4)
     assert builder.replays_packed_graph is replays_packed_graph
+    assert builder.replays_uniform_graph is replays_uniform_graph
     assert not hasattr(other_builder, "replays_packed_graph")
 
 
@@ -462,9 +460,7 @@ def _packed_metadata(
         dtypes=(torch.bfloat16, torch.float32),
         mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
     )
-    builder = TorchTitanLinearAttentionMetadataBuilder(
-        spec, [], config, torch.device(device)
-    )
+    builder = _linear_builder(config, spec, device)
     query_start_loc = torch.tensor(offsets, dtype=torch.int32)
     block_table = torch.tensor(slots, device=device, dtype=torch.int32).unsqueeze(1)
     return builder.build(
@@ -796,6 +792,79 @@ def test_speculative_step_replays_in_breakable_graph(monkeypatch) -> None:
         assert torch.equal(graph_state, eager_state)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("mode", ["align", "none"])
+@pytest.mark.parametrize("path", ["packed", "verify"])
+def test_update_block_table_matches_build_with_drafts(mode, path) -> None:
+    """With drafts, vLLM reuses one GDN group's metadata for the next; only slots differ."""
+    first, other, reference = (_draft_builder(mode) for _ in range(3))
+    if path == "packed":
+        # verify, 1-token row that resumes a state, prefill; "align" state columns 4, 3, 1.
+        step = dict(
+            query_lens=[4, 1, 9],
+            context_lens=[32, 24, 0],
+            num_draft_tokens=[3, -1, -1],
+            num_accepted_tokens=[2, 3, 1],
+        )
+    else:
+        step = dict(
+            query_lens=[4, 4],
+            context_lens=[32, 24],
+            num_draft_tokens=[3, 3],
+            num_accepted_tokens=[2, 3],
+        )
+    num_reqs = len(step["query_lens"])
+    first_table = [
+        [8 * row + column for column in range(1, 9)] for row in range(num_reqs)
+    ]
+    other_table = [[100 + slot for slot in row] for row in first_table]
+    for builder in (first, other, reference):
+        builder.replays_packed_graph = path == "packed"
+        builder.replays_uniform_graph = path == "verify"
+    num_tokens = 32 if path == "packed" else 8
+    other.dummy_run_uniform = path == "verify"
+    captured = _draft_step(
+        other, **step, slots=first_table, num_tokens=num_tokens, capture=True
+    )
+    other.dummy_run_uniform = None
+    # Stale values from an earlier step, so every copy and zeroing is checked.
+    for buffer in (
+        other.query_start_loc,
+        other.has_initial_state,
+        other.spec_query_start_loc,
+        other.spec_state_indices_tensor,
+        other.num_accepted_tokens,
+        other.spec_sequence_masks,
+        other.spec_token_mask,
+        other.prefill_query_start_loc,
+        other.prefill_state_indices,
+    ):
+        buffer.fill_(True if buffer.dtype == torch.bool else -1)
+
+    first_metadata = _draft_step(
+        first, **step, slots=first_table, num_tokens=num_tokens
+    )
+    updated = other.update_block_table(
+        first_metadata,
+        torch.tensor(other_table, device="cuda", dtype=torch.int32),
+        torch.zeros(num_tokens, device="cuda", dtype=torch.int64),
+    )
+
+    expected = _draft_step(reference, **step, slots=other_table, num_tokens=num_tokens)
+    assert expected.spec_state_indices_tensor.max() > 100
+    for field in fields(expected):
+        want, got = getattr(expected, field.name), getattr(updated, field.name)
+        if not isinstance(want, torch.Tensor):
+            assert got == want, field.name
+            continue
+        assert torch.equal(got, want), field.name
+        # The graph captured this builder's buffers, not the first group's.
+        if field.name != "state_block_column":
+            assert (
+                got.data_ptr() == getattr(captured, field.name).data_ptr()
+            ), field.name
+
+
 def _qwen3_5_gdn_layer(num_speculative_tokens: int, num_slots: int) -> gdn.VLLMInnerGDN:
     """A `VLLMInnerGDN` with random conv and SSM pools; slot 0 is vLLM's null slot.
 
@@ -902,6 +971,84 @@ def _speculative_metadata(
             block_table_tensor=torch.tensor(slots, device="cuda", dtype=torch.int32),
             slot_mapping=torch.zeros(num_tokens, device="cuda", dtype=torch.int64),
         ),
+        num_accepted_tokens=torch.tensor(
+            num_accepted_tokens, device="cuda", dtype=torch.int32
+        ),
+        num_decode_draft_tokens_cpu=torch.tensor(num_draft_tokens, dtype=torch.int32),
+    )
+
+
+def _linear_builder(
+    config: VllmConfig, spec: MambaSpec, device: str = "cpu"
+) -> TorchTitanLinearAttentionMetadataBuilder:
+    # vLLM's GDN builder, the parent class, reads the model's HF config on CUDA hosts.
+    config.model_config = cast(Any, SimpleNamespace(hf_text_config=SimpleNamespace()))
+    return TorchTitanLinearAttentionMetadataBuilder(
+        spec, [], config, torch.device(device)
+    )
+
+
+def _draft_builder(mode: str = "none") -> TorchTitanLinearAttentionMetadataBuilder:
+    """Builder for Qwen3.5 GDN layers with k = 3 drafts, FULL graphs up to 64 tokens."""
+    config = VllmConfig()
+    config.speculative_config = cast(
+        Any, SimpleNamespace(num_speculative_tokens=3, parallel_drafting=False)
+    )
+    config.compilation_config = CompilationConfig(
+        mode=CompilationMode.NONE,
+        cudagraph_mode=CUDAGraphMode.FULL,
+        cudagraph_capture_sizes=[4, 8, 16, 32, 64],
+        max_cudagraph_capture_size=64,
+        cudagraph_num_of_warmups=1,
+    )
+    config.scheduler_config = SchedulerConfig(
+        max_model_len=128,
+        max_num_seqs=4,
+        max_num_batched_tokens=64,
+        is_encoder_decoder=False,
+    )
+    config.cache_config.mamba_cache_mode = mode
+    spec = MambaSpec(
+        block_size=8,
+        shapes=((6, _CHANNELS), (_HEADS, _HEAD_DIM, _HEAD_DIM)),
+        dtypes=(torch.bfloat16, torch.float32),
+        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+    )
+    return _linear_builder(config, spec, "cuda")
+
+
+def _draft_step(
+    builder: TorchTitanLinearAttentionMetadataBuilder,
+    *,
+    query_lens: list[int],
+    context_lens: list[int],
+    slots: list[list[int]],
+    num_draft_tokens: list[int],
+    num_accepted_tokens: list[int],
+    num_tokens: int | None = None,
+    capture: bool = False,
+) -> TorchTitanLinearAttentionMetadata:
+    """Build one step, as vLLM's runner does. `num_tokens`: the padded token count."""
+    query_start_loc = torch.tensor([0, *query_lens], dtype=torch.int32).cumsum(0).int()
+    seq_lens = [context + query for context, query in zip(context_lens, query_lens)]
+    num_tokens = num_tokens or sum(query_lens)
+    common = CommonAttentionMetadata(
+        query_start_loc=query_start_loc.cuda(),
+        query_start_loc_cpu=query_start_loc,
+        seq_lens=torch.tensor(seq_lens, device="cuda", dtype=torch.int32),
+        seq_lens_cpu_upper_bound=torch.tensor(seq_lens, dtype=torch.int32),
+        num_reqs=len(query_lens),
+        num_actual_tokens=num_tokens,
+        max_query_len=max(query_lens),
+        max_seq_len=max(seq_lens),
+        block_table_tensor=torch.tensor(slots, device="cuda", dtype=torch.int32),
+        slot_mapping=torch.zeros(num_tokens, device="cuda", dtype=torch.int64),
+    )
+    if capture:
+        return builder.build_for_cudagraph_capture(common)
+    return builder.build(
+        0,
+        common,
         num_accepted_tokens=torch.tensor(
             num_accepted_tokens, device="cuda", dtype=torch.int32
         ),
