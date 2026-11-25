@@ -24,7 +24,6 @@ from torchtitan.distributed.batch_invariant import (
     set_batch_invariance,
 )
 from torchtitan.models.qwen3_5 import build_model_config
-from torchtitan.observability.logging import init_logger
 from torchtitan.rl.generator.attention import gdn as paged_gdn
 from torchtitan.rl.generator.vllm import registry
 from torchtitan.rl.generator.vllm.attention import gdn
@@ -165,8 +164,10 @@ def test_gdn_full_runner_matches_eager(
         assert any(
             step["kind"] == "mixed" and step["path"] == "PACKED" for step in replayed
         )
-        # capture_model logs it after checking that every drafter graph was captured.
-        assert "MTP drafter captured" in (tmp_path / "full.log").read_text()
+        # Start-up captured every drafter graph (TorchTitanEagleProposer.dummy_run), so no draft
+        # step captures while serving.
+        num_drafter_graphs, missing_drafter_graphs = full["drafter_graphs"]
+        assert num_drafter_graphs > 0 and missing_drafter_graphs == []
     else:
         single_token = [step for step in replayed if step["path"] == "SINGLE_TOKEN"]
         assert any(step["initial"] == [False] for step in single_token)
@@ -408,6 +409,23 @@ def run_engine(
             for layer in layers.values():
                 for state in layer.kv_cache:
                     state.zero_()
+        if drafts and mode == "full":
+            drafter = runner.drafter
+            expected = {
+                descriptor
+                for _, descriptors in drafter.cudagraph_dispatcher.get_capture_descs()
+                for descriptor in descriptors
+            }
+            # vLLM adds an entry before it captures, so count the entries holding a graph.
+            captured = {
+                descriptor
+                for descriptor, entry in drafter.model.entries.items()
+                if entry.capture is not None
+            }
+            result["drafter_graphs"] = [
+                len(expected),
+                sorted(descriptor.num_tokens for descriptor in expected - captured),
+            ]
         replays = []
         if mode == "full":
             entries = runner.model.concrete_cudagraph_entries
@@ -493,7 +511,8 @@ def run_engine(
         "Explain physics.", add_special_tokens=False
     )
     # Then fresh 1-token prompts: one alone, then one that arrives while another runs. With drafts,
-    # vLLM pads that second one with placeholder drafts, which GDN rejects.
+    # vLLM pads that second one with placeholder drafts, which GDN can't run (VLLMEngine.add_requests
+    # rejects 1-token prompts with drafts; this test drives vLLM's LLMEngine directly).
     waves = [([11, 17, 23, 37], 4), ([129], 1), ([9, 13, 29, 41], 3), ([1], 1)]
     if not drafts:
         waves.append(([1, 1], 1))
@@ -522,6 +541,4 @@ def run_engine(
 
 
 if __name__ == "__main__":
-    # Shows TorchTitan's INFO lines, e.g. the drafter capture, in the log the test reads.
-    init_logger()
     run_engine(sys.argv[1], Path(sys.argv[2]), bool(int(sys.argv[3])), int(sys.argv[4]))
