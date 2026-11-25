@@ -24,7 +24,6 @@ from torchtitan.rl.generator.vllm.worker import (
     TorchTitanCudagraphDispatcher,
     TorchTitanGPUModelRunner,
 )
-from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
 from vllm.config import (
     CompilationConfig,
     CompilationMode,
@@ -38,10 +37,7 @@ from vllm.forward_context import (
     override_forward_context,
 )
 from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
-from vllm.v1.attention.backends.gdn_attn import (
-    GDNAttentionMetadata,
-    GDNAttentionMetadataBuilder,
-)
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -657,15 +653,22 @@ def test_verify_rows_match_single_token_decodes(num_accepted) -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "kinds",
-    [("decode", "verify", "prefill"), ("decode", "prefill"), ("decode",)],
+    [
+        ("decode", "verify", "prefill"),
+        ("decode", "prefill"),
+        ("decode",),
+        ("trimmed", "verify", "prefill"),
+    ],
     ids="+".join,
 )
 def test_speculative_step_matches_step_without_drafts(kinds) -> None:
     """Each row of a step with drafts on matches the same request in a step without drafts.
 
-        decode, verify, prefill:  vLLM's builder runs the decode row as a 1-token prefill
-        decode, prefill:          no verify rows; the decode kernel runs the decode row
-        decode:                   a decode-only step
+        decode, verify, prefill:   the decode row resumes after accepting 1 token
+        decode, prefill:           no verify rows
+        decode:                    a decode-only step
+        trimmed, verify, prefill:  the scheduler trimmed the 1-token row's drafts; its last
+                                   verify accepted 3, so it reads its state from slot 3
 
     Requests come in vLLM's order: up to 1 + k tokens first, then prefills. The reference
     step runs the verify row's 4 tokens as one chunk. Outputs, SSM states and conv states
@@ -677,6 +680,7 @@ def test_speculative_step_matches_step_without_drafts(kinds) -> None:
     # kind: (query_len, context_len, num_draft_tokens, num_accepted_tokens)
     shapes = {
         "decode": (1, 40, -1, 1),
+        "trimmed": (1, 40, -1, 3),
         "verify": (4, 40, 3, 2),
         "prefill": (13, 0, -1, 1),
     }
@@ -735,61 +739,193 @@ def test_speculative_step_matches_step_without_drafts(kinds) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_speculative_step_replays_in_breakable_graph(monkeypatch) -> None:
-    """A breakable piecewise graph captured without metadata runs the GDN layer eagerly at
-    replay, with the replay step's metadata (vLLM captures piecewise graphs without any).
+def test_draft_steps_replay_one_packed_graph() -> None:
+    """One packed graph, captured from a dummy batch, replays any mix of rows bitwise vs eager.
 
-        capture:  piece 1 | eager GDN (no metadata: zeros) | piece 2: output * 2
-        replay:   piece 1 | eager GDN (decode + verify + prefill step) | piece 2
+    Rows come in vLLM's order for reorder threshold 1 + k: rows with context and at most
+    4 tokens first. The capture's block table holds real slots, which dummy staging nulls.
+
+        verify, verify, prefill               adjacent verify rows: one null prefill interval
+        verify, trimmed, chunk tail, prefill  1-token rows that resume a state: verify kernels
+        prefill, prefill                      no verify rows
+        verify, verify                        verify rows only, eager takes VERIFY
     """
-    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
     torch.manual_seed(0)
     device = torch.device("cuda")
     weights = _random_gdn_weights(device)
     conv_weight, A_log, dt_bias = weights
-    query_lens, context_lens = [1, 4, 13], [40, 40, 0]
-    slots = [[4 * index + column for column in range(1, 5)] for index in range(3)]
-    metadata = _speculative_metadata(
-        query_lens=query_lens,
-        context_lens=context_lens,
-        slots=slots,
-        num_draft_tokens=[-1, 3, -1],
-        num_accepted_tokens=[1, 2, 1],
-    )
-    tokens = _random_tokens(sum(query_lens), device)
-    eager_layer = _qwen3_5_gdn_layer(num_speculative_tokens=3, num_slots=13)
-    graph_layer = _qwen3_5_gdn_layer(num_speculative_tokens=3, num_slots=13)
-    graph_layer.kv_cache = tuple(state.clone() for state in eager_layer.kv_cache)
-    static_tokens = tuple(torch.zeros_like(tensor) for tensor in tokens)
+    num_tokens = 32
+    slots = [[4 * row + column for column in range(1, 5)] for row in range(4)]
+    graph_builder, eager_builder = _draft_builder(), _draft_builder()
+    graph_layer = _qwen3_5_gdn_layer(num_speculative_tokens=3, num_slots=17)
+    eager_layer = _qwen3_5_gdn_layer(num_speculative_tokens=3, num_slots=17)
+    eager_layer.kv_cache = tuple(pool.clone() for pool in graph_layer.kv_cache)
 
-    no_metadata = ForwardContext(
-        no_compile_layers={}, attn_metadata=None, slot_mapping={}
+    # ======== Capture, as vLLM's mixed dummy batch: 4 requests of 8 tokens ========
+    graph_builder.dummy_run_uniform = False
+    capture_metadata = _draft_step(
+        graph_builder,
+        query_lens=[8] * 4,
+        context_lens=[0] * 4,
+        slots=slots,
+        num_draft_tokens=[],
+        num_accepted_tokens=[],
+        capture=True,
     )
-    capture = BreakableCUDAGraphCapture()
-    with (
-        torch.inference_mode(),
-        override_forward_context(no_metadata),
-        torch.cuda.stream(torch.cuda.Stream()),
-    ):
-        with capture:
-            doubled = 2 * graph_layer._forward(
+    graph_builder.dummy_run_uniform = None
+    static_tokens = _random_tokens(num_tokens, device)
+    context = ForwardContext(
+        no_compile_layers={}, attn_metadata={"gdn": capture_metadata}, slot_mapping={}
+    )
+    with torch.inference_mode(), override_forward_context(context):
+        graph_layer._forward(*static_tokens, conv_weight, None, A_log, dt_bias)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_output = graph_layer._forward(
                 *static_tokens, conv_weight, None, A_log, dt_bias
             )
-    assert capture.num_eager_breaks == 1
+    for graph_pool, eager_pool in zip(graph_layer.kv_cache, eager_layer.kv_cache):
+        assert torch.equal(graph_pool, eager_pool)
 
-    for static, tensor in zip(static_tokens, tokens):
-        static.copy_(tensor)
-    step = ForwardContext(
-        no_compile_layers={}, attn_metadata={"gdn": metadata}, slot_mapping={}
+    # ======== Replay the mixes ========
+    graph_builder.replays_packed_graph = True
+    mixes = [
+        ([4, 4, 13], [40, 50, 0], [3, 3, -1], [2, 4, 1]),
+        ([3, 1, 1, 9], [40, 30, 20, 0], [2, -1, -1, -1], [3, 3, 1, 1]),
+        ([7, 5], [0, 12], [-1, -1], [1, 1]),
+        ([4, 2], [40, 50], [3, 1], [1, 2]),
+    ]
+    for query_lens, context_lens, num_draft_tokens, num_accepted_tokens in mixes:
+        step = dict(
+            query_lens=query_lens,
+            context_lens=context_lens,
+            slots=slots[: len(query_lens)],
+            num_draft_tokens=num_draft_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+        )
+        graph_metadata = _draft_step(graph_builder, **step, num_tokens=num_tokens)
+        assert graph_metadata.execution_path is LinearAttentionExecutionPath.PACKED
+        tokens = _random_tokens(sum(query_lens), device)
+        for static, tensor in zip(static_tokens, tokens):
+            static.zero_()
+            static[: tensor.shape[0]].copy_(tensor)
+        graph.replay()
+        expected = _run(
+            eager_layer, _draft_step(eager_builder, **step), tokens, weights
+        )
+        num_real = sum(query_lens)
+        assert torch.equal(static_output[:num_real].float(), expected), query_lens
+        assert not static_output[num_real:].any()
+        for graph_pool, eager_pool in zip(graph_layer.kv_cache, eager_layer.kv_cache):
+            assert torch.equal(graph_pool, eager_pool), query_lens
+
+    with pytest.raises(RuntimeError, match="past the 16 tokens"):
+        _draft_step(
+            graph_builder,
+            query_lens=[30, 2],
+            context_lens=[0, 40],
+            slots=slots[:2],
+            num_draft_tokens=[-1, 1],
+            num_accepted_tokens=[1, 2],
+            num_tokens=num_tokens,
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_draft_verify_graph_follows_the_dummy_key() -> None:
+    """The uniform graph runs only the verify kernels, whatever vLLM's stale draft counts say.
+
+    warm-up and capture   draft and accepted counts 0 (stale): null slots, counts of 1
+    replay                3 verify rows padded to 4 (16 tokens): bitwise vs eager, zero padding
+    eager, same padding   zero padding over reused NaN memory
+    a 4-token prefill     raises: the uniform graph has no prefill kernels
+    """
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    weights = _random_gdn_weights(device)
+    conv_weight, A_log, dt_bias = weights
+    slots = [[4 * row + column for column in range(1, 5)] for row in range(4)]
+    graph_builder, eager_builder = _draft_builder(), _draft_builder()
+    graph_layer = _qwen3_5_gdn_layer(num_speculative_tokens=3, num_slots=17)
+    eager_layer = _qwen3_5_gdn_layer(num_speculative_tokens=3, num_slots=17)
+    eager_layer.kv_cache = tuple(pool.clone() for pool in graph_layer.kv_cache)
+    dummy = dict(
+        query_lens=[4] * 4,
+        context_lens=[4] * 4,
+        slots=slots,
+        num_draft_tokens=[0] * 4,
+        num_accepted_tokens=[0] * 4,
     )
-    with torch.inference_mode(), override_forward_context(step):
-        capture.replay()
-    torch.cuda.synchronize()
 
-    expected = _run(eager_layer, metadata, tokens, weights)
-    _assert_close(doubled.float() / 2, expected)
-    for graph_state, eager_state in zip(graph_layer.kv_cache, eager_layer.kv_cache):
-        assert torch.equal(graph_state, eager_state)
+    graph_builder.dummy_run_uniform = True
+    warmup_metadata = _draft_step(graph_builder, **dummy)
+    capture_metadata = _draft_step(graph_builder, **dummy, capture=True)
+    graph_builder.dummy_run_uniform = None
+    for metadata in (warmup_metadata, capture_metadata):
+        assert metadata.execution_path is LinearAttentionExecutionPath.VERIFY
+        assert not metadata.spec_state_indices_tensor.any()
+        assert (metadata.num_accepted_tokens == 1).all()
+    static_tokens = _random_tokens(16, device)
+    context = ForwardContext(
+        no_compile_layers={}, attn_metadata={"gdn": capture_metadata}, slot_mapping={}
+    )
+    with torch.inference_mode(), override_forward_context(context):
+        graph_layer._forward(*static_tokens, conv_weight, None, A_log, dt_bias)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_output = graph_layer._forward(
+                *static_tokens, conv_weight, None, A_log, dt_bias
+            )
+
+    graph_builder.replays_uniform_graph = True
+    # vLLM pads a uniform batch with zero-token rows at the end.
+    padded = dict(
+        query_lens=[4, 4, 4, 0],
+        context_lens=[40, 50, 60, 0],
+        slots=[*slots[:3], [0] * 4],
+        num_draft_tokens=[3, 3, 3, -1],
+        num_accepted_tokens=[2, 4, 1, 1],
+    )
+    _draft_step(graph_builder, **padded)
+    tokens = _random_tokens(12, device)
+    for static, tensor in zip(static_tokens, tokens):
+        static.zero_()
+        static[:12].copy_(tensor)
+    graph.replay()
+    real = {name: values[:3] for name, values in padded.items()}
+    expected = _run(eager_layer, _draft_step(eager_builder, **real), tokens, weights)
+    assert torch.equal(static_output[:12].float(), expected)
+    assert not static_output[12:].any()
+    for graph_pool, eager_pool in zip(graph_layer.kv_cache, eager_layer.kv_cache):
+        assert torch.equal(graph_pool, eager_pool)
+
+    # The verify kernels leave the padding unwritten. Free NaN blocks of their output's size
+    # first, so the eager run's buffers reuse them: only the zeroing makes the padding zero.
+    probe_layer = _qwen3_5_gdn_layer(num_speculative_tokens=3, num_slots=17)
+    probe_metadata = _draft_step(eager_builder, **padded, num_tokens=16)
+    assert probe_metadata.execution_path is LinearAttentionExecutionPath.VERIFY
+    probe_tokens = _random_tokens(16, device)
+    poison = [
+        torch.full(
+            (16, _HEADS, _HEAD_DIM), torch.nan, device=device, dtype=torch.bfloat16
+        )
+        for _ in range(32)
+    ]
+    del poison
+    padded_output = _run(probe_layer, probe_metadata, probe_tokens, weights)
+    assert not padded_output[12:].any()
+
+    with pytest.raises(RuntimeError, match="uniform verify graph met row 3"):
+        _draft_step(
+            graph_builder,
+            query_lens=[4] * 4,
+            context_lens=[40, 50, 60, 0],
+            slots=slots,
+            num_draft_tokens=[3, 3, 3, -1],
+            num_accepted_tokens=[2, 4, 1, 1],
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -876,6 +1012,7 @@ def _qwen3_5_gdn_layer(num_speculative_tokens: int, num_slots: int) -> gdn.VLLMI
     layer.num_speculative_tokens = num_speculative_tokens
     layer.local_num_k_heads = layer.local_num_v_heads = _HEADS
     layer.head_k_dim = layer.head_v_dim = _HEAD_DIM
+    layer.conv_kernel_size = 4
     conv_rows = 3 + num_speculative_tokens
     layer.kv_cache = (
         (torch.randn(num_slots, conv_rows, _CHANNELS, device="cuda") * 0.5).bfloat16(),
@@ -924,57 +1061,19 @@ def _speculative_metadata(
     slots: list[list[int]],
     num_draft_tokens: list[int],
     num_accepted_tokens: list[int],
-) -> GDNAttentionMetadata:
-    """vLLM's GDN builder metadata for one step with k = 3 drafts.
+) -> TorchTitanLinearAttentionMetadata:
+    """TorchTitan's builder metadata for one eager step with k = 3 drafts.
 
-    Each request lists 1 + k state slots: a verify row (3 draft tokens) uses all of them,
-    other rows (-1) only the first. `num_accepted_tokens` counts the last step's accepted tokens.
+    Each request lists 1 + k state slots: verify-kernel rows use all of them, other rows only
+    the first. `num_accepted_tokens` counts the last step's accepted tokens.
     """
-    config = VllmConfig()
-    config.speculative_config = SimpleNamespace(
-        num_speculative_tokens=3, parallel_drafting=False
-    )
-    config.model_config = SimpleNamespace(hf_text_config=SimpleNamespace())
-    config.compilation_config = CompilationConfig(
-        mode=CompilationMode.NONE,
-        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
-        cudagraph_capture_sizes=[4, 8, 16],
-        max_cudagraph_capture_size=16,
-    )
-    config.scheduler_config = SchedulerConfig(
-        max_model_len=128,
-        max_num_seqs=4,
-        max_num_batched_tokens=128,
-        is_encoder_decoder=False,
-    )
-    config.cache_config.mamba_cache_mode = "none"
-    spec = MambaSpec(
-        block_size=8,
-        shapes=((6, _CHANNELS), (_HEADS, _HEAD_DIM, _HEAD_DIM)),
-        dtypes=(torch.bfloat16, torch.float32),
-        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
-    )
-    builder = GDNAttentionMetadataBuilder(spec, [], config, torch.device("cuda"))
-    query_start_loc = torch.tensor([0, *query_lens], dtype=torch.int32).cumsum(0).int()
-    seq_lens = [context + query for context, query in zip(context_lens, query_lens)]
-    num_tokens = sum(query_lens)
-    return builder.build(
-        0,
-        CommonAttentionMetadata(
-            query_start_loc=query_start_loc.cuda(),
-            query_start_loc_cpu=query_start_loc,
-            seq_lens=torch.tensor(seq_lens, device="cuda", dtype=torch.int32),
-            num_reqs=len(query_lens),
-            num_actual_tokens=num_tokens,
-            max_query_len=max(query_lens),
-            max_seq_len=max(seq_lens),
-            block_table_tensor=torch.tensor(slots, device="cuda", dtype=torch.int32),
-            slot_mapping=torch.zeros(num_tokens, device="cuda", dtype=torch.int64),
-        ),
-        num_accepted_tokens=torch.tensor(
-            num_accepted_tokens, device="cuda", dtype=torch.int32
-        ),
-        num_decode_draft_tokens_cpu=torch.tensor(num_draft_tokens, dtype=torch.int32),
+    return _draft_step(
+        _draft_builder(),
+        query_lens=query_lens,
+        context_lens=context_lens,
+        slots=slots,
+        num_draft_tokens=num_draft_tokens,
+        num_accepted_tokens=num_accepted_tokens,
     )
 
 

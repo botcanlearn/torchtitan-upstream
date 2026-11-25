@@ -1349,10 +1349,6 @@ def test_cuda_graph_config_with_draft_tokens():
         **kwargs
     )
     assert cfg.cudagraph_capture_sizes[-1] == 256
-    # vLLM's GDN builder graphs only uniform verify steps: steps with prefill replay
-    # piecewise graphs.
-    cfg = VLLMCudaGraphConfig(mode="FULL").get_vllm_compilation_config(**kwargs)
-    assert cfg.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
 
 
 def test_cuda_graph_full_mode_extends_capture_sizes_to_chunk():

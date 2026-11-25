@@ -6,6 +6,7 @@
 
 """TorchTitan-owned vLLM worker and model runner customizations."""
 
+import logging
 from collections.abc import Set
 from contextlib import nullcontext
 from dataclasses import replace
@@ -13,6 +14,7 @@ from dataclasses import replace
 import torch
 from torch import nn
 from torch.distributed.tensor import DTensor
+from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.utils.math_utils import round_up
@@ -31,6 +33,8 @@ from torchtitan.rl.generator.vllm.attention.linear_attention import (
 )
 from torchtitan.tools.utils import device_type
 
+logger = logging.getLogger(__name__)
+
 
 class TorchTitanCudagraphDispatcher(CudagraphDispatcher):
     """Give decode batches their own FULL graphs, apart from prefill and mixed batches.
@@ -44,6 +48,8 @@ class TorchTitanCudagraphDispatcher(CudagraphDispatcher):
       - FA4 sizes its grid from ``max_query_len``: decode attention runs 1.3-2.0x
         longer from 32 sequences at head dim 64 and from 64 at head dim 128
         (GB300, 16-token pages).
+      - With k drafts, a decode batch verifies 1 + k tokens per row: GDN runs only its
+        verify kernels, FA4 its verify-as-decode call.
 
     Uniform-decode batch in FULL mode:
       num_tokens <= max_decode_capture_size              -> decode graph
@@ -59,6 +65,8 @@ class TorchTitanCudagraphDispatcher(CudagraphDispatcher):
 
     TODO: drop this class once vLLM captures FULL decode graphs next to FULL mixed
     graphs without piecewise compilation.
+    TODO: test drafts at DP > 1 (a rank's verify graph padded to a peer's size, idle
+    ranks' dummy batches); only one GPU has run them.
     """
 
     def initialize_cudagraph_keys(
@@ -139,6 +147,58 @@ class TorchTitanGPUModelRunner(GPUModelRunner):
         super().load_model(load_dummy_weights)
         assert not self.cudagraph_dispatcher.keys_initialized
         self.cudagraph_dispatcher = TorchTitanCudagraphDispatcher(self.vllm_config)
+        # Before vLLM resolves the mode against the attention backends (capture_model checks it).
+        self.requested_cudagraph_mode = self.compilation_config.cudagraph_mode
+
+    def capture_model(self) -> int:
+        """Check the settings GDN's FULL graphs with drafts rely on, capture, then check the
+        drafter's graphs.
+
+            mode            vLLM can turn FULL into FULL_AND_PIECEWISE; GDN's piecewise
+                            capture has no metadata, so its graphs would replay zeros
+            reorder         rows with at most 1 + k tokens must lead every batch
+            drafter graphs  TorchTitanEagleProposer.dummy_run captures them under FULL
+        """
+        drafts = self.uniform_decode_query_len > 1
+        if drafts and self._linear_attention_builders():
+            resolved_mode = self.compilation_config.cudagraph_mode
+            if (
+                self.requested_cudagraph_mode == CUDAGraphMode.FULL
+                and resolved_mode != CUDAGraphMode.FULL
+            ):
+                raise RuntimeError(
+                    f"vLLM resolved cudagraph_mode FULL to {resolved_mode}, which GDN with "
+                    "drafts doesn't support: an attention backend reports less than "
+                    "AttentionCGSupport.ALWAYS"
+                )
+            if self.reorder_batch_threshold != self.uniform_decode_query_len:
+                raise RuntimeError(
+                    f"GDN with drafts needs a batch-reorder threshold of "
+                    f"{self.uniform_decode_query_len} (1 + k); the attention builders give "
+                    f"{self.reorder_batch_threshold}"
+                )
+        graph_memory = super().capture_model()
+
+        drafter = getattr(self, "drafter", None)
+        if drafter is not None and isinstance(drafter.model, BreakableCUDAGraphWrapper):
+            expected = {
+                descriptor
+                for _, descriptors in drafter.cudagraph_dispatcher.get_capture_descs()
+                for descriptor in descriptors
+            }
+            # vLLM adds an entry before it captures, so count the entries holding a graph.
+            captured = {
+                descriptor
+                for descriptor, entry in drafter.model.entries.items()
+                if entry.capture is not None
+            }
+            if expected - captured:
+                raise RuntimeError(
+                    f"The MTP drafter captured {len(captured)} of its {len(expected)} "
+                    f"CUDA graphs; missing: {sorted(d.num_tokens for d in expected - captured)}"
+                )
+            logger.info("MTP drafter captured %d CUDA graphs", len(captured))
+        return graph_memory
 
     def _linear_attention_builders(
         self,
@@ -345,6 +405,25 @@ class TorchTitanEagleProposer(EagleProposer):
                 "num_speculative_tokens supports Qwen3.5-architecture MTP drafts, got "
                 f"{self.draft_model_config.architecture}"
             )
+
+    def dummy_run(
+        self,
+        num_tokens: int,
+        use_cudagraphs: bool = True,
+        is_graph_capturing: bool = False,
+        slot_mappings: dict[str, torch.Tensor] | None = None,
+    ) -> None:
+        # vLLM's _dummy_run asks for drafter graphs only while the target captures piecewise
+        # graphs, so under a FULL target the first draft step would capture while serving.
+        # TODO: drop once vLLM's _dummy_run captures drafter graphs under a FULL target too
+        # (GPUModelRunner._dummy_run: "Eagle currently only supports PIECEWISE cudagraphs").
+        capture = is_graph_capturing and not self.speculative_config.enforce_eager
+        super().dummy_run(
+            num_tokens,
+            use_cudagraphs=use_cudagraphs or capture,
+            is_graph_capturing=is_graph_capturing,
+            slot_mappings=slot_mappings,
+        )
 
     def _create_draft_vllm_config(self) -> VllmConfig:
         # vLLM's MTP models read their HF config from `vllm_config.model_config`.
