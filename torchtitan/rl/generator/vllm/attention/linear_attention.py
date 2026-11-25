@@ -38,7 +38,7 @@ from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
 class LinearAttentionExecutionPath(Enum):
     SINGLE_TOKEN = auto()
     PACKED = auto()
-    # Drafts only: every row verifies drafts, so only vLLM's verify kernels run.
+    # Drafts only: every row runs vLLM's verify kernels (rows with drafts, 1-token rows after context).
     VERIFY = auto()
 
 
@@ -290,8 +290,8 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
     ) -> TorchTitanLinearAttentionMetadata:
         """Stage a step with drafts so one graph runs any mix of rows.
 
-        vLLM's verify kernels run the "verify-kernel rows": verify rows, and 1-token rows
-        that resume a state where the last verify left it. Attention Gym's prefill kernels
+        vLLM's verify kernels run the rows with drafts, and the 1-token rows after context
+        (they resume a state where the last verify left it). Attention Gym's prefill kernels
         run the other rows. Each kernel gets the null slot (0) on the rows it doesn't own.
 
         Example: k = 3, rows [verify 4, verify 4, 1-token resume, prefill 13], 24 padded
@@ -299,17 +299,18 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
 
             query_start_loc          [0, 4, 8, 9, 22, 24, 24]   row 4: padding (null)
             spec_query_start_loc     [0, 4, 8, 9, 20, 20, 20]   clamped at S
-            prefill_query_start_loc  [0, 9, 9, 9, 22, 24, 24]   adjacent verify-kernel rows merged
+            prefill_query_start_loc  [0, 9, 9, 9, 22, 24, 24]   rows 0-2 merged into one null interval
             spec_state_indices       rows 0-2: their 1 + k slots; others 0
             prefill_state_indices    row 3: its slot; others 0
             spec_token_mask          tokens 0-8 True, of the first S
 
-            VERIFY  uniform graph or dummy run, or an eager step with no prefill row: rows only
+            VERIFY  uniform graph, uniform dummy run, or an eager step with no prefill row
             PACKED  any other step: prefill kernels on every token, verify kernels on the first S
 
         The batch puts rows with context and at most 1 + k tokens first (the runner's reorder
-        threshold, checked in `TorchTitanGPUModelRunner.capture_model`), so verify-kernel rows
-        end within S. Dummy runs ignore vLLM's stale counts: null slots, accepted counts of 1.
+        threshold, checked in `TorchTitanGPUModelRunner.capture_model`), so the rows that run
+        the verify kernels end within S. Dummy runs ignore vLLM's stale counts: null slots,
+        accepted counts of 1.
         """
         num_reqs = m.num_reqs
         num_tokens = m.num_actual_tokens
@@ -320,7 +321,7 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         # ======== Classify rows on the CPU ========
         is_dummy_run = self.dummy_run_uniform is not None
         if is_dummy_run:
-            is_verify_row = np.zeros(num_reqs, dtype=bool)
+            runs_verify_kernels = np.zeros(num_reqs, dtype=bool)
         else:
             num_decode_draft_tokens = (
                 np.full(num_reqs, -1)
@@ -333,7 +334,7 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 # a verify that accepted j > 1 tokens takes the prefill kernels and reads the
                 # state after the first token, as vLLM's own builder does. Rare: the scheduler
                 # trims every draft of a step only at the token budget.
-                is_verify_row = np.zeros(num_reqs, dtype=bool)
+                runs_verify_kernels = np.zeros(num_reqs, dtype=bool)
             else:
                 if m.seq_lens_cpu_upper_bound is None:
                     raise RuntimeError(
@@ -343,15 +344,15 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 context_lens = (
                     m.seq_lens_cpu_upper_bound[:num_reqs].numpy() - query_lens
                 )
-                is_verify_row = (num_decode_draft_tokens >= 0) | (
+                runs_verify_kernels = (num_decode_draft_tokens >= 0) | (
                     (query_lens == 1) & (context_lens > 0)
                 )
             if self.replays_uniform_graph:
                 self._check_uniform_rows(query_lens, num_decode_draft_tokens)
-            self._check_verify_rows_lead(
-                query_start_loc_cpu, is_verify_row, num_verify_tokens
+            self._check_verify_kernel_rows_fit(
+                query_start_loc_cpu, runs_verify_kernels, num_verify_tokens
             )
-        is_prefill_row = ~is_verify_row & (query_lens > 0)
+        runs_prefill_kernels = ~runs_verify_kernels & (query_lens > 0)
 
         # A replayed graph decides first: an idle DP rank's uniform dummy batch can replay
         # the packed graph.
@@ -364,7 +365,8 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         else:
             path = (
                 LinearAttentionExecutionPath.VERIFY
-                if not is_prefill_row.any() and num_tokens <= self.max_verify_tokens
+                if not runs_prefill_kernels.any()
+                and num_tokens <= self.max_verify_tokens
                 else LinearAttentionExecutionPath.PACKED
             )
         num_rows = (
@@ -373,28 +375,34 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
 
         # ======== Stage the slots and accepted counts on the GPU ========
         row_masks = np.zeros((2, num_rows), dtype=bool)
-        row_masks[0, :num_reqs] = is_verify_row
-        row_masks[1, :num_reqs] = is_prefill_row
-        verify_mask, prefill_mask = async_tensor_h2d(row_masks, device=self.device)
+        row_masks[0, :num_reqs] = runs_verify_kernels
+        row_masks[1, :num_reqs] = runs_prefill_kernels
+        runs_verify_kernels_gpu, runs_prefill_kernels_gpu = async_tensor_h2d(
+            row_masks, device=self.device
+        )
         spec_slots = torch.gather(
             m.block_table_tensor[:num_reqs],
             1,
             state_block_column + self.spec_block_offsets,
         )
         self.spec_state_indices_tensor[:num_reqs].copy_(
-            torch.where(verify_mask[:num_reqs, None], spec_slots, 0)
+            torch.where(runs_verify_kernels_gpu[:num_reqs, None], spec_slots, 0)
         )
         self.spec_state_indices_tensor[num_reqs:].zero_()
         self.prefill_state_indices[:num_rows].copy_(
-            torch.where(prefill_mask, self.state_indices[:num_rows], 0)
+            torch.where(runs_prefill_kernels_gpu, self.state_indices[:num_rows], 0)
         )
         self.prefill_state_indices[num_rows:].zero_()
-        self.spec_sequence_masks[:num_rows].copy_(verify_mask)
+        self.spec_sequence_masks[:num_rows].copy_(runs_verify_kernels_gpu)
         self.spec_sequence_masks[num_rows:].zero_()
         self.num_accepted_tokens.fill_(1)
         if num_accepted_tokens is not None and not is_dummy_run:
             self.num_accepted_tokens[:num_reqs].copy_(
-                torch.where(verify_mask[:num_reqs], num_accepted_tokens[:num_reqs], 1)
+                torch.where(
+                    runs_verify_kernels_gpu[:num_reqs],
+                    num_accepted_tokens[:num_reqs],
+                    1,
+                )
             )
 
         # ======== Stage the offsets and the token mask ========
@@ -405,11 +413,11 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         )
         prefill_query_start_loc = np.full(num_rows + 1, num_tokens, dtype=np.int32)
         prefill_query_start_loc[: num_reqs + 1] = query_start_loc_cpu
-        # The later rows of each run of adjacent verify-kernel rows start where the run ends,
-        # so the chunk kernel sees the run as one null interval (row-aligned, as in
+        # In each run of adjacent rows that run the verify kernels, the later rows start where the
+        # run ends, so the chunk kernel sees the run as one null interval (row-aligned, as in
         # _stage_decode_split).
-        is_later_in_run = is_verify_row & np.r_[False, is_verify_row[:-1]]
-        is_last_in_run = is_verify_row & ~np.r_[is_verify_row[1:], False]
+        is_later_in_run = runs_verify_kernels & np.r_[False, runs_verify_kernels[:-1]]
+        is_last_in_run = runs_verify_kernels & ~np.r_[runs_verify_kernels[1:], False]
         row_index = np.arange(num_reqs)
         run_last_row = np.minimum.accumulate(
             np.where(is_last_in_run, row_index, num_reqs)[::-1]
@@ -421,7 +429,7 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             async_tensor_h2d(prefill_query_start_loc, device=self.device)
         )
         spec_token_mask = np.zeros(num_verify_tokens, dtype=bool)
-        verify_tokens = np.repeat(is_verify_row, query_lens)[:num_verify_tokens]
+        verify_tokens = np.repeat(runs_verify_kernels, query_lens)[:num_verify_tokens]
         spec_token_mask[: verify_tokens.shape[0]] = verify_tokens
         self.spec_token_mask[:num_verify_tokens].copy_(
             async_tensor_h2d(spec_token_mask, device=self.device)
@@ -429,12 +437,12 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
 
         return TorchTitanLinearAttentionMetadata(
             execution_path=path,
-            num_prefills=int(is_prefill_row.sum()),
-            num_prefill_tokens=int(query_lens[is_prefill_row].sum()),
+            num_prefills=int(runs_prefill_kernels.sum()),
+            num_prefill_tokens=int(query_lens[runs_prefill_kernels].sum()),
             num_decodes=0,
             num_decode_tokens=0,
-            num_spec_decodes=int(is_verify_row.sum()),
-            num_spec_decode_tokens=int(query_lens[is_verify_row].sum()),
+            num_spec_decodes=int(runs_verify_kernels.sum()),
+            num_spec_decode_tokens=int(query_lens[runs_verify_kernels].sum()),
             num_actual_tokens=num_tokens,
             has_initial_state=self.has_initial_state[:num_rows],
             non_spec_query_start_loc=self.query_start_loc[: num_rows + 1],
@@ -464,15 +472,15 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 "TorchTitanGPUModelRunner._determine_batch_execution_and_padding)"
             )
 
-    def _check_verify_rows_lead(
+    def _check_verify_kernel_rows_fit(
         self,
         query_start_loc_cpu: np.ndarray,
-        is_verify_row: np.ndarray,
+        runs_verify_kernels: np.ndarray,
         num_verify_tokens: int,
     ) -> None:
-        """Raise if a verify-kernel row ends past the tokens the verify kernels see."""
+        """Raise if a row that runs the verify kernels ends past the tokens those kernels see."""
         late_rows = np.flatnonzero(
-            is_verify_row & (query_start_loc_cpu[1:] > num_verify_tokens)
+            runs_verify_kernels & (query_start_loc_cpu[1:] > num_verify_tokens)
         )
         if late_rows.size:
             row = int(late_rows[0])
@@ -481,11 +489,12 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             # first tokens the verify kernels would read its slot's old state (stock vLLM too).
             # Zeroing its first spec slot first would fix both; RL prompts are never 1 token.
             raise RuntimeError(
-                f"Verify-kernel row {row} ends at token {int(query_start_loc_cpu[row + 1])}, "
-                f"past the {num_verify_tokens} tokens the verify kernels see. Rows with "
-                "context and at most 1 + k tokens should lead the batch (reorder threshold "
-                "1 + k). A 1-token prompt without context, padded with placeholder drafts, "
-                "sorts after the prefills: not supported"
+                f"Row {row} runs GDN's verify kernels (it has drafts, or 1 token after context) "
+                f"but ends at token {int(query_start_loc_cpu[row + 1])}, past the "
+                f"{num_verify_tokens} tokens those kernels see. Rows with context and at most "
+                "1 + k tokens should lead the batch (reorder threshold 1 + k). A 1-token prompt "
+                "without context, padded with placeholder drafts, sorts after the prefills: not "
+                "supported"
             )
 
     def _stage_decode_split(
