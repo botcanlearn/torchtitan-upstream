@@ -614,7 +614,8 @@ def test_verify_rows_match_single_token_decodes(num_accepted) -> None:
     draft_tokens, next_tokens = _random_tokens(4, device), _random_tokens(4, device)
 
     def verify(tokens, context_len, num_accepted_tokens):
-        metadata = _speculative_metadata(
+        metadata = _draft_step(
+            _draft_builder(),
             query_lens=[4],
             context_lens=[context_len],
             slots=[[1, 2, 3, 4]],
@@ -705,7 +706,8 @@ def test_speculative_step_matches_step_without_drafts(kinds) -> None:
         plain_layer.kv_cache[1][index + 1] = state
     tokens = _random_tokens(sum(query_lens), device)
 
-    drafts_metadata = _speculative_metadata(
+    drafts_metadata = _draft_step(
+        _draft_builder(),
         query_lens=list(query_lens),
         context_lens=list(context_lens),
         slots=slots,
@@ -970,7 +972,6 @@ def test_update_block_table_matches_build_with_drafts(mode, path) -> None:
         other.spec_query_start_loc,
         other.spec_state_indices_tensor,
         other.num_accepted_tokens,
-        other.spec_sequence_masks,
         other.spec_token_mask,
         other.prefill_query_start_loc,
         other.prefill_state_indices,
@@ -1055,28 +1056,6 @@ def _assert_close(got: torch.Tensor, want: torch.Tensor) -> None:
     assert error < 1e-2, error
 
 
-def _speculative_metadata(
-    query_lens: list[int],
-    context_lens: list[int],
-    slots: list[list[int]],
-    num_draft_tokens: list[int],
-    num_accepted_tokens: list[int],
-) -> TorchTitanLinearAttentionMetadata:
-    """TorchTitan's builder metadata for one eager step with k = 3 drafts.
-
-    Each request lists 1 + k state slots: verify-kernel rows use all of them, other rows only
-    the first. `num_accepted_tokens` counts the last step's accepted tokens.
-    """
-    return _draft_step(
-        _draft_builder(),
-        query_lens=query_lens,
-        context_lens=context_lens,
-        slots=slots,
-        num_draft_tokens=num_draft_tokens,
-        num_accepted_tokens=num_accepted_tokens,
-    )
-
-
 def _linear_builder(
     config: VllmConfig, spec: MambaSpec, device: str = "cpu"
 ) -> TorchTitanLinearAttentionMetadataBuilder:
@@ -1127,7 +1106,12 @@ def _draft_step(
     num_tokens: int | None = None,
     capture: bool = False,
 ) -> TorchTitanLinearAttentionMetadata:
-    """Build one step, as vLLM's runner does. `num_tokens`: the padded token count."""
+    """Build one step, as vLLM's runner does, one row per request.
+
+    slots                 each request's 1 + k state slots; rows that run the verify kernels use all
+    num_accepted_tokens   what each request's last step accepted
+    num_tokens            the padded token count
+    """
     query_start_loc = torch.tensor([0, *query_lens], dtype=torch.int32).cumsum(0).int()
     seq_lens = [context + query for context, query in zip(context_lens, query_lens)]
     num_tokens = num_tokens or sum(query_lens)

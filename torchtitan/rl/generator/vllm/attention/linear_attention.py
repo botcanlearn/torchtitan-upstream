@@ -79,9 +79,12 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
 
     A subclass of vLLM's GDN builder, so vLLM's runner passes it the draft and accepted
     counts (`GPUModelRunner._build_attention_metadata`). Every method and buffer it uses is
-    its own; the parent's `__init__` sets `num_spec` and the batch-reorder threshold
-    (1 + k with drafts, else 1).
+    its own; the parent's `__init__` sets `num_spec`, `use_spec_decode` and the batch-reorder
+    threshold (1 + k with drafts, else 1).
     """
+
+    # TODO: drop the subclass once vLLM's runner passes draft counts to builders that ask for
+    # them, not by isinstance (GPUModelRunner._build_attention_metadata).
 
     supports_update_block_table = True
 
@@ -164,9 +167,6 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             )
             self.num_accepted_tokens = torch.ones(
                 num_rows, device=device, dtype=torch.int32
-            )
-            self.spec_sequence_masks = torch.zeros(
-                num_rows, device=device, dtype=torch.bool
             )
             # The verify kernels see at most this many leading tokens (see _build_with_drafts).
             self.max_verify_tokens = (1 + self.num_spec) * self.num_reqs_capacity
@@ -329,11 +329,9 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 else num_decode_draft_tokens_cpu[:num_reqs].numpy()
             )
             if num_accepted_tokens is None:
-                # TODO: vLLM passes accepted counts only on steps with drafts
-                # (GPUModelRunner._build_attention_metadata). So a 1-token row that resumes after
-                # a verify that accepted j > 1 tokens takes the prefill kernels and reads the
-                # state after the first token, as vLLM's own builder does. Rare: the scheduler
-                # trims every draft of a step only at the token budget.
+                # TODO: vLLM passes accepted counts only on steps with drafts, so here a 1-token row
+                # that resumes after accepting j > 1 tokens reads the state after its first token
+                # (vLLM's builder too). Rare: only when the token budget trims every draft.
                 runs_verify_kernels = np.zeros(num_reqs, dtype=bool)
             else:
                 if m.seq_lens_cpu_upper_bound is None:
@@ -393,8 +391,6 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             torch.where(runs_prefill_kernels_gpu, self.state_indices[:num_rows], 0)
         )
         self.prefill_state_indices[num_rows:].zero_()
-        self.spec_sequence_masks[:num_rows].copy_(runs_verify_kernels_gpu)
-        self.spec_sequence_masks[num_rows:].zero_()
         self.num_accepted_tokens.fill_(1)
         if num_accepted_tokens is not None and not is_dummy_run:
             self.num_accepted_tokens[:num_reqs].copy_(
@@ -445,10 +441,8 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             num_spec_decode_tokens=int(query_lens[runs_verify_kernels].sum()),
             num_actual_tokens=num_tokens,
             has_initial_state=self.has_initial_state[:num_rows],
-            non_spec_query_start_loc=self.query_start_loc[: num_rows + 1],
             spec_query_start_loc=self.spec_query_start_loc[: num_rows + 1],
             spec_state_indices_tensor=self.spec_state_indices_tensor[:num_rows],
-            spec_sequence_masks=self.spec_sequence_masks[:num_rows],
             num_accepted_tokens=self.num_accepted_tokens[:num_rows],
             prefill_query_start_loc=self.prefill_query_start_loc[: num_rows + 1],
             prefill_state_indices=self.prefill_state_indices[:num_rows],
@@ -579,7 +573,7 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
             this group:   spec_state_indices [[7, 8, 9, 10], [0, 0, 0, 0]] prefill_state_indices [0, 11]
         """
         num_reqs = metadata.state_block_column.shape[0]
-        num_rows = metadata.spec_sequence_masks.shape[0]
+        num_rows = metadata.has_initial_state.shape[0]
         num_verify_tokens = metadata.spec_token_mask.shape[0]
         spec_slots = torch.gather(
             block_table[:num_reqs],
@@ -600,9 +594,7 @@ class TorchTitanLinearAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         self.prefill_state_indices[num_rows:].zero_()
         copies = {
             "has_initial_state": self.has_initial_state[:num_rows],
-            "non_spec_query_start_loc": self.query_start_loc[: num_rows + 1],
             "spec_query_start_loc": self.spec_query_start_loc[: num_rows + 1],
-            "spec_sequence_masks": self.spec_sequence_masks[:num_rows],
             "num_accepted_tokens": self.num_accepted_tokens[:num_rows],
             "prefill_query_start_loc": self.prefill_query_start_loc[: num_rows + 1],
             "spec_token_mask": self.spec_token_mask[:num_verify_tokens],
