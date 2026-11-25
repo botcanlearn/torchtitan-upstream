@@ -44,15 +44,12 @@ def test_forward_matches_causal_attention(
 
     vLLM passes max_model_len as max_seq_len when it captures FULL graphs. An fp8 cache holds
     K / k_scale and V / v_scale in e4m3 and the query arrives as q / q_scale in e4m3, as vLLM
-    writes them; the reference runs on the dequantized values.
+    writes them; the reference runs on the dequantized values. fp8 verify steps make one varlen
+    call with the step's rows (max_seqlen_q 4) at any row count.
     """
+    is_fp8 = kv_cache_dtype == "fp8"
     # 8: the impl's row cutoff (`_MIN_VERIFY_ROWS_ON_DECODE_KERNEL`).
-    takes_decode_kernel = is_uniform_verify and len(query_lens) >= 8
-    if kv_cache_dtype == "fp8" and takes_decode_kernel:
-        # TODO: drop once `_verify_rows_as_decode` passes the fp8 descales.
-        pytest.skip(
-            "fp8 verify rows pass no descales yet; the engine refuses fp8 with drafts"
-        )
+    takes_decode_kernel = is_uniform_verify and not is_fp8 and len(query_lens) >= 8
     max_seq_len = 262144  # Qwen3.8-27B's max_model_len
     torch.manual_seed(0)
     device = torch.device("cuda")
@@ -70,7 +67,6 @@ def test_forward_matches_causal_attention(
             kv_cache_dtype=kv_cache_dtype,
         )
     assert impl.verify_query_len == 4
-    is_fp8 = kv_cache_dtype == "fp8"
     q_scale, k_scale, v_scale = (2.0, 0.5, 4.0) if is_fp8 else (1.0, 1.0, 1.0)
 
     # The engine's cache: [pages, KV heads, page, K | V], with pages in random order.
@@ -148,6 +144,9 @@ def test_forward_matches_causal_attention(
         impl.forward(layer, query, None, None, stored_cache, metadata, output=output)
     assert verify_rows_as_decode.called == takes_decode_kernel
     assert fa4_calls.call_count == num_fa4_calls
+    if is_fp8 and is_uniform_verify:
+        assert fa4_calls.call_args.kwargs["max_seqlen_q"] == 4
+        assert fa4_calls.call_args.kwargs["cu_seqlens_q"] is metadata.query_start_loc
 
     for row, (num_queries, num_keys) in enumerate(zip(query_lens, seq_lens)):
         if num_keys == 0:

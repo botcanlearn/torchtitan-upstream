@@ -866,11 +866,6 @@ def test_fp8_kv_cache_refusals(tmp_path, model, parallelism, debug, match):
         )
 
 
-def test_fp8_kv_cache_refuses_drafts_at_config_time():
-    with pytest.raises(ValueError, match="does not support num_speculative_tokens=3"):
-        VLLMEngine.Config(kv_cache_dtype="fp8", num_speculative_tokens=3)
-
-
 def test_qwen36_27b_perf_config():
     from torchtitan_recipes.rl.alphabet_sort import rl_grpo_qwen3_6_27b_varlen_perf
 

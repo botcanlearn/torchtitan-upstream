@@ -262,14 +262,6 @@ class VLLMEngine(GenerationEngine):
                 raise ValueError(
                     f"num_speculative_tokens must be >= 0, got {self.num_speculative_tokens}"
                 )
-            if self.kv_cache_dtype == "fp8" and self.num_speculative_tokens > 0:
-                # TODO: support MTP drafts with fp8: `_verify_rows_as_decode` doesn't pass the
-                # fp8 descales to FA4 yet.
-                raise ValueError(
-                    f"kv_cache_dtype='fp8' does not support num_speculative_tokens="
-                    f"{self.num_speculative_tokens} yet: MTP verify rows don't pass the fp8 "
-                    "descales to FA4. Set num_speculative_tokens=0 or kv_cache_dtype='auto'"
-                )
 
     def __init__(
         self,

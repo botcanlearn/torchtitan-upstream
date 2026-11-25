@@ -18,7 +18,6 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
-from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionType, MultipleOf
 from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionBackend,
@@ -31,7 +30,7 @@ from vllm.v1.attention.backends.flash_attn_diffkv import (
     FlashAttentionDiffKVImpl,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, is_quantized_kv_cache, KVCacheSpec
 
 from torchtitan.distributed.batch_invariant import is_in_batch_invariant_mode
 from torchtitan.models.base.module import Module
@@ -328,9 +327,6 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
             )
             # vLLM's loader sets these scales to 1.0 after the model's `to_empty`
             # (Attention.process_weights_after_loading); weight syncs skip them (non-persistent).
-            # TODO: FA4 copies each stride-0 descale to a contiguous tensor: 3 copy kernels per
-            # call, ~5 us per layer (GB300). A per-layer (num_kv_heads,) scale expanded on dim 0
-            # passes FA4's layout check without copies.
             descales = (
                 layer._q_scale.expand(descale_shape),
                 layer._k_scale.expand(descale_shape),
@@ -380,8 +376,10 @@ class TorchTitanVarlenInnerAttentionImpl(FlashAttentionImpl):
         # plain varlen call serves verify rows; keep this path only for shapes token mode refuses
         # (qpk * n <= 32 < npo2(qpk) * npo2(n), e.g. qpk 6 at k = 4). If FA4 declines token mode,
         # fuse the tail and the merge into one Triton kernel.
+        # fp8 verify steps skip it: the one varlen call below takes their descales.
         if (
             is_uniform
+            and descales is None
             and max_seqlen_q == self.verify_query_len
             and seqused_k.shape[0] >= _MIN_VERIFY_ROWS_ON_DECODE_KERNEL
             and current_flash_attention_impl() == "FA4"
