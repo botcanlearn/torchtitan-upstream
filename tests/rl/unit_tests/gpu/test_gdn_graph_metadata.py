@@ -660,6 +660,7 @@ def test_verify_rows_match_single_token_decodes(num_accepted) -> None:
         ("decode",),
         ("trimmed", "verify", "prefill"),
         ("trimmed", "decode", "prefill"),
+        ("verify", "prefill_with_context"),
     ],
     ids="+".join,
 )
@@ -673,6 +674,8 @@ def test_speculative_step_matches_step_without_drafts(kinds) -> None:
                                    verify accepted 3, so it reads its state from slot 3
         trimmed, decode, prefill:  no row has drafts, so vLLM passes no accepted counts; the
                                    trimmed row's slot 3 comes from the runner's counts
+        verify, prefill_with_context:  the prefill row reads its history, as a new turn after
+                                       a prefix-cache hit does
 
     Requests come in vLLM's order: up to 1 + k tokens first, then prefills. The reference
     step runs the verify row's 4 tokens as one chunk. Outputs, SSM states and conv states
@@ -687,6 +690,7 @@ def test_speculative_step_matches_step_without_drafts(kinds) -> None:
         "trimmed": (1, 40, -1, 3),
         "verify": (4, 40, 3, 2),
         "prefill": (13, 0, -1, 1),
+        "prefill_with_context": (13, 40, -1, 1),
     }
     query_lens, context_lens, num_draft_tokens, num_accepted_tokens = zip(
         *(shapes[kind] for kind in kinds)
