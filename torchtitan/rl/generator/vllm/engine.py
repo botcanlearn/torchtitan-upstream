@@ -672,9 +672,9 @@ class VLLMEngine(GenerationEngine):
                     and len(request.prompt.token_ids) < 2
                 ):
                     raise ValueError(
-                        f"{request.request_id} has a 1-token prompt, which "
-                        f"num_speculative_tokens={self.config.num_speculative_tokens} "
-                        "does not support"
+                        f"{request.request_id} has a {len(request.prompt.token_ids)}-token "
+                        f"prompt; num_speculative_tokens={self.config.num_speculative_tokens} "
+                        "needs at least 2 tokens"
                     )
                 sampling_params = _build_sampling_params(request.sampling)
                 if self._coordinate_kv_offload:
