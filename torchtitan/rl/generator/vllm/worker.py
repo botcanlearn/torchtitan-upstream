@@ -189,7 +189,24 @@ class TorchTitanGPUModelRunner(GPUModelRunner):
                 key for key in keys[CUDAGraphMode.FULL] if not key.uniform
             }
 
-    def _determine_batch_execution_and_padding(self, num_tokens: int, *args, **kwargs):
+    def _prepare_inputs(self, scheduler_output: SchedulerOutput, *args, **kwargs):
+        # vLLM writes num_decode_draft_tokens only on steps with drafts. Reset it, so a step without
+        # drafts doesn't dispatch on the last step's counts (_determine_batch_execution_and_padding).
+        if (
+            self.uniform_decode_query_len > 1
+            and not scheduler_output.scheduled_spec_decode_tokens
+        ):
+            self.num_decode_draft_tokens.np.fill(-1)
+        return super()._prepare_inputs(scheduler_output, *args, **kwargs)
+
+    def _determine_batch_execution_and_padding(
+        self,
+        num_tokens: int,
+        num_reqs: int,
+        *args,
+        force_uniform_decode: bool | None = None,
+        **kwargs,
+    ):
         """Tell the model how many of this step's tokens are real, before padding.
 
         vLLM calls this once before every forward: from ``execute_model`` for a
@@ -201,10 +218,29 @@ class TorchTitanGPUModelRunner(GPUModelRunner):
         those rows off Dist-MoE's network; graph replay reads the value published
         for the real step. Linear attention (GDN/KDA) builders then learn whether
         the step replays a packed FULL graph.
+
+        With k drafts, a real step replays a uniform graph only if every row verifies k drafts:
+
+            k = 3, 4 tokens per row, draft counts [3, 3, 3, 3]   -> uniform graph
+            k = 3, 4 tokens per row, draft counts [3, 3, 3, -1]  -> mixed graph (a 4-token prefill)
         """
         self.get_model().set_num_valid_tokens(num_tokens)
+        # vLLM calls a step uniform when every row has 1 + k tokens. Its GDN builder refills a
+        # uniform graph's buffers only when every row verifies, so a 1 + k token prefill row
+        # would replay it on the last verify step's slots and accepted counts.
+        # TODO: drop with the move to vLLM's V2 model runner, which keeps steps with a prefill row
+        # off decode graphs (decode_graph_eligible on vLLM main, vllm/v1/worker/gpu/model_runner.py).
+        if force_uniform_decode is None and self.uniform_decode_query_len > 1:
+            num_decode_draft_tokens = self.num_decode_draft_tokens.np[:num_reqs]
+            force_uniform_decode = bool(
+                (num_decode_draft_tokens == self.uniform_decode_query_len - 1).all()
+            )
         result = super()._determine_batch_execution_and_padding(
-            num_tokens, *args, **kwargs
+            num_tokens,
+            num_reqs,
+            *args,
+            force_uniform_decode=force_uniform_decode,
+            **kwargs,
         )
         # TODO: drop once vLLM passes the dispatched (cudagraph_mode, batch_descriptor)
         # to AttentionMetadataBuilder.build.
