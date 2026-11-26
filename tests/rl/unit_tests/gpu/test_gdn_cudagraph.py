@@ -46,12 +46,29 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 
 
 @pytest.mark.parametrize(
-    "batch_invariant, num_speculative_tokens",
-    [(False, 0), (True, 0), (False, 3)],
-    ids=["regular", "batch-invariant", "drafts"],
+    "batch_invariant, num_speculative_tokens, kv_cache_dtype",
+    [
+        (False, 0, "auto"),
+        (True, 0, "auto"),
+        (False, 3, "auto"),
+        pytest.param(
+            False,
+            3,
+            "fp8",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available()
+                or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+                reason="an fp8 KV cache runs FA4's fp8 forward, which needs SM100/SM103",
+            ),
+        ),
+    ],
+    ids=["regular", "batch-invariant", "drafts", "drafts-fp8-kv"],
 )
 def test_gdn_full_runner_matches_eager(
-    tmp_path: Path, batch_invariant: bool, num_speculative_tokens: int
+    tmp_path: Path,
+    batch_invariant: bool,
+    num_speculative_tokens: int,
+    kv_cache_dtype: str,
 ) -> None:
     model = os.environ.get(MODEL_ENV)
     if not model:
@@ -82,6 +99,7 @@ def test_gdn_full_runner_matches_eager(
             str(output),
             str(int(batch_invariant)),
             str(num_speculative_tokens),
+            kv_cache_dtype,
         ]
         log_path = output.with_suffix(".log")
         with log_path.open("w") as log:
@@ -296,7 +314,11 @@ def test_single_token_reused_state_capture(monkeypatch, batch_invariant: bool) -
 
 
 def run_engine(
-    mode: str, output: Path, batch_invariant: bool, num_speculative_tokens: int
+    mode: str,
+    output: Path,
+    batch_invariant: bool,
+    num_speculative_tokens: int,
+    kv_cache_dtype: str,
 ) -> None:
     assert int(os.environ["WORLD_SIZE"]) == 1
     # Eager runs the real token count, while FULL replay pads it up to a capture
@@ -351,6 +373,7 @@ def run_engine(
             model=model,
             config_format=registry.TORCHTITAN_CONFIG_FORMAT,
             dtype="bfloat16",
+            kv_cache_dtype=kv_cache_dtype,
             worker_cls=registry.TORCHTITAN_WORKER_CLS,
             distributed_executor_backend="external_launcher",
             tensor_parallel_size=1,
@@ -541,4 +564,10 @@ def run_engine(
 
 
 if __name__ == "__main__":
-    run_engine(sys.argv[1], Path(sys.argv[2]), bool(int(sys.argv[3])), int(sys.argv[4]))
+    run_engine(
+        sys.argv[1],
+        Path(sys.argv[2]),
+        bool(int(sys.argv[3])),
+        int(sys.argv[4]),
+        sys.argv[5],
+    )
