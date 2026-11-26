@@ -294,7 +294,7 @@ class VLLMEngine(GenerationEngine):
           replays a FULL graph; the drafter replays piecewise graphs (`VLLMCudaGraphConfig.mode`).
         - Not supported with `debug.batch_invariant`, generator data parallelism > 1,
           models with a vision encoder or non-CUDA devices. `add_requests` rejects
-          1-token prompts."""
+          prompts under 2 tokens."""
 
         @property
         def uses_mooncake_store(self) -> bool:
