@@ -157,6 +157,7 @@ def _runner(model) -> TorchTitanGPUModelRunner:
     runner = cast(Any, object.__new__(TorchTitanGPUModelRunner))
     runner.get_model = lambda: model  # type: ignore[method-assign]
     runner.attn_groups = []
+    runner.uniform_decode_query_len = 1
     return runner
 
 
@@ -173,4 +174,7 @@ def test_runner_publishes_the_unpadded_count_before_vllm_pads():
     assert model.published == [31]
     parent.assert_called_once()
     assert parent.call_args.args[0] == 31
-    assert parent.call_args.kwargs == {"force_eager": True}
+    assert parent.call_args.kwargs == {
+        "force_eager": True,
+        "force_uniform_decode": None,
+    }
