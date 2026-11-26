@@ -40,6 +40,7 @@ from vllm.forward_context import (
     get_forward_context,
     override_forward_context,
 )
+from vllm.model_executor.layers.attention import Attention
 
 MODEL_ENV = "TORCHTITAN_QWEN3_5_0_8B_HF_PATH"
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -51,6 +52,9 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
         (False, 0, "auto"),
         (True, 0, "auto"),
         (False, 3, "auto"),
+        # TODO: list this file in integration_test_rl_b200.yaml once "[models] GDN/KDA chunk
+        # kernels: always fused" lands. Until then GDN's warpdrive kernel can fail to build there
+        # (it does with cutlass DSL 4.7.1), so no CI job runs this case.
         pytest.param(
             False,
             3,
@@ -119,6 +123,8 @@ def test_gdn_full_runner_matches_eager(
             )
         results.append(json.loads(output.read_text()))
     eager, full = results
+    # A cache that silently fell back to bf16 would still match bitwise.
+    assert eager["kv_cache_dtypes"] == full["kv_cache_dtypes"] == [kv_cache_dtype]
     # Real packed recurrence ran eagerly and was captured for FULL replay.
     assert [False, "PACKED"] in eager["recurrent_calls"]
     assert [True, "PACKED"] in full["recurrent_calls"]
@@ -428,6 +434,14 @@ def run_engine(
             if isinstance(layer, gdn.VLLMInnerGDN)
         }
         assert layers
+        # The attention forward takes its fp8 path when its impl's kv_cache_dtype is fp8.
+        result["kv_cache_dtypes"] = sorted(
+            {
+                layer.impl.kv_cache_dtype
+                for layer in runner.compilation_config.static_forward_context.values()
+                if isinstance(layer, Attention)
+            }
+        )
         with torch.inference_mode():
             for layer in layers.values():
                 for state in layer.kv_cache:
